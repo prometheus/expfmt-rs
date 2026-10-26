@@ -1,0 +1,174 @@
+# `expfmt-rs` specification and implementation plan
+
+`expfmt-rs` provides official Rust decoders, and later encoders, for Prometheus and OpenMetrics wire exposition formats.
+
+## Background and goals
+
+Rust metric pipelines and tools currently lack an official, spec-compliant parser for the full set of Prometheus and OpenMetrics wire formats. Existing community crates cover only basic Prometheus 0.0.4 text and allocate on the heap for every sample.
+
+This repository targets two use cases:
+
+1. High-throughput columnar ingestion for OpenTelemetry Arrow. [`open-telemetry/otel-arrow#3277`](https://github.com/open-telemetry/otel-arrow/issues/3277) defines an OTAP-native `prometheus_scrape` receiver in Rust. Its steady-state path streams scrape bytes through pre-allocation relabeling and metric family assembly directly into Apache Arrow metric records. That avoids intermediate Go-style `pmetric` or SDK `metricdata` object graphs and fits thread-per-core `!Send` runtimes with bounded memory.
+2. Programmatic inspection and ecosystem tooling. Validation tools like OpenTelemetry Weaver live-checking `/metrics` endpoints against semantic conventions, test harnesses, and Rust CLIs need an ergonomic API that decodes any Prometheus or OpenMetrics payload into standard [`io.prometheus.client.MetricFamily`](https://github.com/prometheus/client_model/blob/master/io/prometheus/client/metrics.proto) protobuf structs, matching Go's [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt).
+
+## Supported formats and content negotiation
+
+The `format` module mirrors [`prometheus/common/expfmt/expfmt.go`](https://github.com/prometheus/common/blob/main/expfmt/expfmt.go), parsing `Content-Type` and `Accept` headers into format descriptors and UTF-8 escaping schemes: `allow-utf-8`, `underscores`, `dots`, and `values`.
+
+| Format | Baseline `Content-Type` | Scope |
+| :--- | :--- | :--- |
+| Prometheus Text 0.0.4 | `text/plain; version=0.0.4; charset=utf-8` | Classic text exposition, `# HELP` and `# TYPE`, classic histograms and summaries, optional timestamps, UTF-8 quoted metric and label names. |
+| OpenMetrics 1.0 | `application/openmetrics-text; version=1.0.0; charset=utf-8` and `0.0.1` | Strict grammar per the [OpenMetrics 1.0 ABNF specification](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#abnf) in RFC 5234, `# UNIT`, `_created` lines, exemplars, `info`, `stateset`, `gaugehistogram`, and mandatory `# EOF`. |
+| OpenMetrics 2.0 | `application/openmetrics-text; version=2.0.0; charset=utf-8` and `2.0.0-rc` | Native histograms in text format, inline start timestamps `st@...`, UTF-8 names, and composite values matching [`model/textparse/openmetrics2parse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetrics2parse.go). |
+| Prometheus Protobuf | `application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited` plus `text` and `compact-text` | Varint length-delimited `MetricFamily` messages from [`metrics.proto`](https://github.com/prometheus/client_model/blob/master/io/prometheus/client/metrics.proto), native sparse exponential histograms, and custom-bucket native histograms. |
+
+### ABNF-driven OpenMetrics parsing
+
+OpenMetrics 1.0 defines a normative [ABNF grammar](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#abnf) that takes precedence over the prose specification.
+- We will store machine-readable ABNF grammar files in the repository under `specs/openmetrics_1_0.abnf` and `specs/openmetrics_2_0.abnf`.
+- We will either generate the OpenMetrics parser state tables directly from the ABNF or validate a hand-written zero-copy lexer against an ABNF reference parser in tests and fuzzers.
+
+## Decoding architecture and APIs
+
+Decoding is split into three layers so streaming callers pay zero per-sample heap allocations while test and CLI callers still get a simple struct API:
+
+```text
+                       Scrape payload (&[u8] / Bytes)
+                                     │
+                                     ▼
+        ┌─────────────────────────────────────────────────────────┐
+        │  Layer 0: Streaming event parser (textparse / proto)    │
+        │  - Zero-copy borrowed slices (&[u8] / &str)             │
+        │  - Yields Entry::{Help, Type, Unit, Series, Histogram}  │
+        │  - Pre-allocation metric relabel and drop hook          │
+        └────────────────────┬───────────────────────┬────────────┘
+                             │                       │
+             Primary API     │                       │  Ergonomic API
+                             ▼                       ▼
+        ┌─────────────────────────────────┐  ┌──────────────────────────────┐
+        │  Layer 1: Arrow / OTAP decoder  │  │  Layer 2: Proto DTO decoder  │
+        │  - Metric family assembly       │  │  - MetricFamily structs      │
+        │  - Direct Arrow RecordBatches   │  │    from metrics.proto        │
+        │  - Reusable builders/interners  │  │  - Built for tests, Weaver,  │
+        │  - Fits otel-arrow#3277         │  │    and CLI inspection        │
+        └─────────────────────────────────┘  └──────────────────────────────┘
+```
+
+### Layer 0: Zero-copy streaming parser
+
+Modeled on Prometheus's [`model/textparse.Parser`](https://github.com/prometheus/prometheus/blob/main/model/textparse/interface.go), the low-level parser advances entry-by-entry over a byte slice without allocating per sample:
+
+```rust
+pub enum Entry {
+    Type,
+    Help,
+    Unit,
+    Comment,
+    Series,
+    Histogram,
+}
+
+pub trait Parser<'a> {
+    /// Advances to the next entry in the exposition stream, returning `Ok(None)` at EOF.
+    fn next_entry(&mut self) -> Result<Option<Entry>, ParseError>;
+
+    fn help(&self) -> (&'a [u8], &'a [u8]);
+    fn metric_type(&self) -> (&'a [u8], MetricType);
+    fn unit(&self) -> (&'a [u8], &'a [u8]);
+    fn comment(&self) -> &'a [u8];
+
+    /// Returns the raw series bytes, optional sample timestamp in ms, and float64 value.
+    fn series(&self) -> (&'a [u8], Option<i64>, f64);
+
+    /// Returns the raw series bytes, optional timestamp in ms, and parsed native histogram.
+    fn histogram(&self) -> (&'a [u8], Option<i64>, HistogramRef<'a>);
+
+    /// Returns the start timestamp in ms if present via `st@...` or `_created`.
+    fn start_timestamp(&self) -> Option<i64>;
+
+    /// Populates the caller's reusable label buffer for the current sample.
+    fn labels(&self, buf: &mut LabelsBuffer<'a>) -> Result<(), ParseError>;
+
+    /// Iterates over exemplars attached to the current sample.
+    fn exemplars(&self, buf: &mut ExemplarsBuffer<'a>) -> Result<(), ParseError>;
+}
+```
+
+### Layer 1: Columnar Apache Arrow decoder
+
+This is the primary API, designed for the [`open-telemetry/otel-arrow#3277`](https://github.com/open-telemetry/otel-arrow/issues/3277) scrape pipeline:
+
+```text
+scrape bytes
+  -> streaming parser
+  -> metric relabel/drop
+  -> metric family assembler
+  -> direct OTAP metric records
+```
+
+- `ArrowDecoder` appends parsed metrics, attributes, number data points, summary data points, classic and exponential histogram data points, and exemplars directly into Arrow array builders (`arrow-array` and `arrow-schema`), matching the relational `id` and `parent_id` tables in [`rust/otap-dataflow/crates/pdata`](https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/pdata).
+- A `LabelFilter` / `Relabeler` hook runs on the borrowed `LabelsBuffer` from Layer 0 so dropped series never allocate in Arrow builders or metric family state.
+- The metric family assembler groups classic histogram `_bucket`, `_sum`, `_count`, and `_created` lines and summary `quantile`, `_sum`, `_count`, and `_created` lines into complete metric families.
+- Configurable translation policies control counter `_total` and unit suffix handling, `info` and `stateset` projection, and untyped series handling.
+- `ArrowDecoder` owns its scratch buffers and Arrow builders without internal locks or global state, so a per-core `!Send` receiver can reuse allocations across scrapes with bounded memory.
+
+### Layer 2: Proto DTO decoder
+
+For tests, CLIs, and validation tools such as OpenTelemetry Weaver live-check, the `dto` module parses any supported wire format into [`io.prometheus.client.MetricFamily`](https://github.com/prometheus/client_model/blob/master/io/prometheus/client/metrics.proto) structs generated with `prost`. This matches [`expfmt.NewDecoder`](https://github.com/prometheus/common/blob/main/expfmt/decode.go) and [`expfmt.TextParser`](https://github.com/prometheus/common/blob/main/expfmt/text_parse.go) in Go:
+
+```rust
+/// Decodes an exposition payload of the given `Format` into a list of `MetricFamily` DTOs.
+pub fn decode_to_metric_families(
+    input: &[u8],
+    format: Format,
+    opts: &DecodeOptions,
+) -> Result<Vec<proto::MetricFamily>, DecodeError>;
+
+/// Streaming iterator yielding one `MetricFamily` DTO at a time.
+pub struct MetricFamilyDecoder<'a> { /* ... */ }
+```
+
+## Testing and verification
+
+### Test corpus from `prometheus/prometheus` and `prometheus/common`
+
+We will test against fixtures from the upstream Go implementations:
+- [`prometheus/prometheus/model/textparse`](https://github.com/prometheus/prometheus/tree/main/model/textparse) test cases covering Prometheus text, OpenMetrics 1.0, OpenMetrics 2.0, protobuf, custom-bucket native histograms, UTF-8 names, exemplars, start timestamps, and malformed input errors.
+- [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt) testdata files and parser edge cases from `text_parse_test.go`, `decode_test.go`, and `encode_test.go`.
+
+### Differential testing with Go `prometheus/common/expfmt` encoders
+
+A Go test harness under `tests/go-harness/` will verify wire compatibility against the reference Go implementation:
+- The harness calls Go's [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt) encoders in [`text_create.go`](https://github.com/prometheus/common/blob/main/expfmt/text_create.go), [`openmetrics_create.go`](https://github.com/prometheus/common/blob/main/expfmt/openmetrics_create.go), [`openmetrics_2_0_create.go`](https://github.com/prometheus/common/blob/main/expfmt/openmetrics_2_0_create.go), and [`encode.go`](https://github.com/prometheus/common/blob/main/expfmt/encode.go) to serialize canonical `MetricFamily` inputs across all `Format` and `EscapingScheme` combinations (`AllowUTF8`, `EscapeUnderscores`, `EscapeDots`, `EscapeValues`).
+- Rust tests decode the Go-generated bytes through both `dto::decode_to_metric_families` and `arrow::ArrowDecoder` and assert semantic equivalence with the input `MetricFamily` messages.
+- Differential tests also run Go's `model/textparse` parsers (`NewPromParser`, `NewOpenMetricsParser`, `NewOpenMetrics2Parser`, `NewProtobufParser`) and Rust's Layer 0 `Parser` side by side on identical inputs.
+
+## Implementation plan
+
+### Phase 1: Workspace layout, format negotiation, proto DTOs, and test fixtures
+- Set up the Cargo workspace with optional feature flags for `arrow` and `dto`, plus `tests/go-harness`.
+- Implement `Format`, `FormatType`, `EscapingScheme`, and `Content-Type` / `Accept` header parsing matching [`prometheus/common/expfmt/expfmt.go`](https://github.com/prometheus/common/blob/main/expfmt/expfmt.go).
+- Compile [`io/prometheus/client/metrics.proto`](https://github.com/prometheus/client_model/blob/master/io/prometheus/client/metrics.proto) with `prost-build` for the `dto` module.
+- Import initial test fixtures from [`prometheus/prometheus/model/textparse`](https://github.com/prometheus/prometheus/tree/main/model/textparse) and [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt).
+
+### Phase 2: Prometheus Text 0.0.4, OpenMetrics 1.0, DTO decoder, and Go encoder harness
+- Add `specs/openmetrics_1_0.abnf` from the [OpenMetrics 1.0 specification](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#abnf).
+- Implement Layer 0 `Parser` for Prometheus Text 0.0.4 and OpenMetrics 1.0, including UTF-8 quoting and unescaping, exemplars, `_created` timestamps, `# UNIT`, and `# EOF` validation.
+- Implement Layer 2 `dto::decode_to_metric_families` assembling classic histograms, summaries, counters, gauges, untyped, info, and stateset metrics into `proto::MetricFamily`.
+- Wire up the Go `prometheus/common/expfmt` encoder harness in CI for round-trip differential testing across Prometheus Text and OpenMetrics 1.0.
+
+### Phase 3: OpenMetrics 2.0 and Prometheus protobuf decoding
+- Implement Layer 0 and Layer 2 support for OpenMetrics 2.0 matching [`openmetrics2parse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/openmetrics2parse.go) (native histograms in text format, `st@` start timestamps, composite values) and add `specs/openmetrics_2_0.abnf`.
+- Implement delimited and text protobuf decoding (`FmtProtoDelim`, `FmtProtoText`, `FmtProtoCompact`), including native sparse histograms and NHCB conversion matching [`protobufparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/protobufparse.go) and [`nhcbparse.go`](https://github.com/prometheus/prometheus/blob/main/model/textparse/nhcbparse.go).
+- Extend the Go `expfmt` encoder harness to cover `FmtOpenMetrics_2_0_0` and `FmtProtoDelim`.
+
+### Phase 4: Columnar Apache Arrow and OTAP decoder
+- Implement `arrow::ArrowDecoder` targeting the [`open-telemetry/otel-arrow#3277`](https://github.com/open-telemetry/otel-arrow/issues/3277) architecture.
+- Add the pre-allocation `LabelFilter` and relabeling hook on Layer 0 `LabelsBuffer`.
+- Implement bounded metric family assembly into Arrow `RecordBatch` tables with dictionary encoding and buffer reuse across scrapes.
+- Verify Arrow batch output against synthetic fixtures and the Go `expfmt` differential harness.
+
+### Phase 5: Benchmarks, fuzzing, and initial release
+- Add `cargo-fuzz` targets comparing Rust decoding against Go `expfmt` and `textparse`.
+- Add `criterion` benchmarks measuring throughput in MB/s and allocations per sample across Layer 0 `Parser`, Layer 1 `ArrowDecoder`, and Layer 2 `dto`.
+- Publish the `0.1.0` crate release and integrate with `open-telemetry/otel-arrow`.
