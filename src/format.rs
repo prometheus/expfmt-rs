@@ -23,6 +23,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
 
+/// MIME type for Prometheus classic text exposition format.
+pub const TEXT_TYPE: &str = "text/plain";
+
 /// Version string for Prometheus classic text format.
 pub const TEXT_VERSION: &str = "0.0.4";
 
@@ -53,6 +56,21 @@ pub const OPEN_METRICS_VERSION_2_0_0: &str = "2.0.0";
 
 /// Content-Type parameter key specifying the UTF-8 metric and label name escaping scheme.
 pub const ESCAPING_KEY: &str = "escaping";
+
+const PROTO_KEY: &str = "proto";
+const ENCODING_KEY: &str = "encoding";
+const VERSION_KEY: &str = "version";
+const CHARSET_KEY: &str = "charset";
+
+const ENCODING_DELIMITED: &str = "delimited";
+const ENCODING_TEXT: &str = "text";
+const ENCODING_COMPACT_TEXT: &str = "compact-text";
+const CHARSET_UTF8: &str = "utf-8";
+
+const ESCAPE_ALLOW_UTF8: &str = "allow-utf-8";
+const ESCAPE_UNDERSCORES: &str = "underscores";
+const ESCAPE_DOTS: &str = "dots";
+const ESCAPE_VALUES: &str = "values";
 
 /// Baseline `Content-Type` string for unknown formats.
 pub const FMT_UNKNOWN: &str = "<unknown>";
@@ -107,10 +125,10 @@ impl EscapingScheme {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::AllowUtf8 => "allow-utf-8",
-            Self::EscapeUnderscores => "underscores",
-            Self::EscapeDots => "dots",
-            Self::EscapeValues => "values",
+            Self::AllowUtf8 => ESCAPE_ALLOW_UTF8,
+            Self::EscapeUnderscores => ESCAPE_UNDERSCORES,
+            Self::EscapeDots => ESCAPE_DOTS,
+            Self::EscapeValues => ESCAPE_VALUES,
         }
     }
 }
@@ -138,10 +156,10 @@ impl FromStr for EscapingScheme {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "allow-utf-8" => Ok(Self::AllowUtf8),
-            "underscores" => Ok(Self::EscapeUnderscores),
-            "dots" => Ok(Self::EscapeDots),
-            "values" => Ok(Self::EscapeValues),
+            ESCAPE_ALLOW_UTF8 => Ok(Self::AllowUtf8),
+            ESCAPE_UNDERSCORES => Ok(Self::EscapeUnderscores),
+            ESCAPE_DOTS => Ok(Self::EscapeDots),
+            ESCAPE_VALUES => Ok(Self::EscapeValues),
             other => Err(UnknownEscapingSchemeError(other.to_owned())),
         }
     }
@@ -262,23 +280,23 @@ impl Format {
 
         match media_type {
             PROTO_TYPE => {
-                if params.get("proto").copied() != Some(PROTO_PROTOCOL) {
+                if params.get(PROTO_KEY).copied() != Some(PROTO_PROTOCOL) {
                     return FormatType::Unknown;
                 }
-                match params.get("encoding").copied() {
-                    Some("delimited") => FormatType::ProtoDelim,
-                    Some("text") => FormatType::ProtoText,
-                    Some("compact-text") => FormatType::ProtoCompact,
+                match params.get(ENCODING_KEY).copied() {
+                    Some(ENCODING_DELIMITED) => FormatType::ProtoDelim,
+                    Some(ENCODING_TEXT) => FormatType::ProtoText,
+                    Some(ENCODING_COMPACT_TEXT) => FormatType::ProtoCompact,
                     _ => FormatType::Unknown,
                 }
             }
             OPEN_METRICS_TYPE => {
-                if params.get("charset").copied() != Some("utf-8") {
+                if params.get(CHARSET_KEY).copied() != Some(CHARSET_UTF8) {
                     return FormatType::Unknown;
                 }
                 FormatType::OpenMetrics
             }
-            "text/plain" => match params.get("version").copied() {
+            TEXT_TYPE => match params.get(VERSION_KEY).copied() {
                 None | Some(TEXT_VERSION) => FormatType::TextPlain,
                 Some(_) => FormatType::Unknown,
             },
@@ -293,7 +311,7 @@ impl Format {
         let Some((_, params)) = parse_media_type(&self.0) else {
             return "";
         };
-        params.get("version").copied().unwrap_or("")
+        params.get(VERSION_KEY).copied().unwrap_or("")
     }
 
     /// Returns whether this format is OpenMetrics 2.0 (`2.0.0` or `2.0.0-rc`).
@@ -404,20 +422,20 @@ pub fn response_format(content_type: &str) -> Format {
 
     match media_type {
         PROTO_TYPE => {
-            if let Some(&p) = params.get("proto")
+            if let Some(&p) = params.get(PROTO_KEY)
                 && p != PROTO_PROTOCOL
             {
                 return Format::UNKNOWN;
             }
-            if let Some(&e) = params.get("encoding")
-                && e != "delimited"
+            if let Some(&e) = params.get(ENCODING_KEY)
+                && e != ENCODING_DELIMITED
             {
                 return Format::UNKNOWN;
             }
             Format::PROTO_DELIM
         }
-        "text/plain" => {
-            if let Some(&v) = params.get("version")
+        TEXT_TYPE => {
+            if let Some(&v) = params.get(VERSION_KEY)
                 && v != TEXT_VERSION
             {
                 return Format::UNKNOWN;
@@ -572,7 +590,7 @@ fn match_format(ac: &AcceptClause<'_>, f: &Format) -> bool {
         return false;
     }
 
-    let mut ac_version = ac.params.get("version").copied().unwrap_or("");
+    let mut ac_version = ac.params.get(VERSION_KEY).copied().unwrap_or("");
     if ac_version.is_empty() && ac.main_type == "application" && ac.sub_type == "openmetrics-text" {
         ac_version = OPEN_METRICS_VERSION_0_0_1;
     }
@@ -581,10 +599,10 @@ fn match_format(ac: &AcceptClause<'_>, f: &Format) -> bool {
     }
 
     for (&k, &v) in &target.params {
-        if k == "charset" {
+        if k == CHARSET_KEY {
             continue;
         }
-        let ac_val = if k == "version" {
+        let ac_val = if k == VERSION_KEY {
             ac_version
         } else {
             ac.params.get(k).copied().unwrap_or("")
