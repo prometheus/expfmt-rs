@@ -144,6 +144,7 @@ pub fn arrow_to_metric_families(
 We will test against fixtures from the upstream Go implementations:
 - [`prometheus/prometheus/model/textparse`](https://github.com/prometheus/prometheus/tree/main/model/textparse) test cases covering Prometheus text, OpenMetrics 1.0, OpenMetrics 2.0, protobuf, custom-bucket native histograms, UTF-8 names, exemplars, start timestamps, and malformed input errors.
 - [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt) testdata files and parser edge cases from `text_parse_test.go`, `decode_test.go`, and `encode_test.go`.
+- To keep fixtures in sync with upstream without requiring a Go toolchain for normal `cargo test` runs, `tests/go-harness/go.mod` pins `github.com/prometheus/prometheus` and `github.com/prometheus/common` (updated via Renovate/Dependabot). A `go generate` sync tool in `tests/go-harness` resolves the module directories from the Go module cache (`go list -m -f '{{.Dir}}'`), copies `expfmt/testdata/*`, and extracts table-driven test cases from `model/textparse/*_test.go` and `expfmt/*_test.go` into checked-in `testdata/` fixtures. CI runs `go generate` and verifies `git diff --exit-code` so dependency bumps keep checked-in fixtures up to date.
 
 ### Differential testing with Go `prometheus/common/expfmt` encoders
 
@@ -158,7 +159,7 @@ A Go test harness under `tests/go-harness/` will verify wire compatibility again
 - Set up the Cargo workspace with `arrow` and optional `dto` feature flags, plus `tests/go-harness`.
 - Implement `Format`, `FormatType`, `EscapingScheme`, and `Content-Type` / `Accept` header parsing matching [`prometheus/common/expfmt/expfmt.go`](https://github.com/prometheus/common/blob/main/expfmt/expfmt.go).
 - Compile [`io/prometheus/client/metrics.proto`](https://github.com/prometheus/client_model/blob/master/io/prometheus/client/metrics.proto) with `prost-build` for the `dto` module.
-- Import initial test fixtures from [`prometheus/prometheus/model/textparse`](https://github.com/prometheus/prometheus/tree/main/model/textparse) and [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt).
+- Add the `go generate` fixture sync tool in `tests/go-harness` and generate initial `testdata/` fixtures from [`prometheus/prometheus/model/textparse`](https://github.com/prometheus/prometheus/tree/main/model/textparse) and [`prometheus/common/expfmt`](https://github.com/prometheus/common/tree/main/expfmt), verified in CI with `git diff --exit-code`.
 
 ### Phase 2: Prometheus Text 0.0.4 and OpenMetrics 1.0 across Layer 0, Layer 1, and Layer 2
 - Add `specs/openmetrics_1_0.abnf` from the [OpenMetrics 1.0 specification](https://github.com/prometheus/OpenMetrics/blob/main/specification/OpenMetrics.md#abnf).
