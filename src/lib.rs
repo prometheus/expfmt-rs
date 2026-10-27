@@ -13,4 +13,6 @@
 
 //! Prometheus and OpenMetrics wire exposition format decoders.
 
+#[cfg(feature = "dto")]
+pub mod dto;
 pub mod format;
