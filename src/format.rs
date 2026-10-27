@@ -111,12 +111,12 @@ pub enum EscapingScheme {
     /// No escaping (`escaping=allow-utf-8`). Full UTF-8 names are allowed (quoted when needed).
     AllowUtf8,
     /// Replace invalid legacy characters with underscores (`escaping=underscores`).
+    /// Matches `model.UnderscoreEscaping`, the default `NameEscapingScheme` in `prometheus/common/model`.
+    #[default]
     EscapeUnderscores,
     /// Escape dots and other invalid characters (`escaping=dots`).
     EscapeDots,
     /// Prefix and hex-encode invalid characters (`escaping=values`).
-    /// Matches `model.ValueEncodingEscaping`, the default `NameEscapingScheme` in `prometheus/common/model`.
-    #[default]
     EscapeValues,
 }
 
@@ -343,7 +343,7 @@ impl Format {
     }
 
     /// Extracts the [`EscapingScheme`] from this [`Format`], falling back to
-    /// [`EscapingScheme::EscapeValues`] (`model.NameEscapingScheme` default) when absent or invalid.
+    /// [`EscapingScheme::EscapeUnderscores`] (`model.NameEscapingScheme` default) when absent or invalid.
     #[must_use]
     pub fn to_escaping_scheme(&self) -> EscapingScheme {
         self.to_escaping_scheme_with_default(EscapingScheme::default())
@@ -748,6 +748,12 @@ mod tests {
                 "format={format}"
             );
         }
+
+        assert_eq!(EscapingScheme::default(), EscapingScheme::EscapeUnderscores);
+        assert_eq!(
+            Format::PROTO_COMPACT.to_escaping_scheme(),
+            EscapingScheme::EscapeUnderscores
+        );
     }
 
     #[test]
