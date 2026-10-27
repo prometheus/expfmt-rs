@@ -442,6 +442,11 @@ pub fn response_format(content_type: &str) -> Format {
             }
             Format::TEXT
         }
+        OPEN_METRICS_TYPE => match params.get(VERSION_KEY).copied() {
+            None | Some(OPEN_METRICS_VERSION_0_0_1) => Format::OPEN_METRICS_0_0_1,
+            Some(OPEN_METRICS_VERSION_1_0_0) => Format::OPEN_METRICS_1_0_0,
+            Some(_) => Format::UNKNOWN,
+        },
         _ => Format::UNKNOWN,
     }
 }
@@ -1064,6 +1069,23 @@ mod tests {
         assert_eq!(response_format("text/plain"), Format::TEXT);
         assert_eq!(
             response_format("text/plain; version=0.0.5"),
+            Format::UNKNOWN
+        );
+        assert_eq!(
+            response_format(FMT_OPEN_METRICS_0_0_1),
+            Format::OPEN_METRICS_0_0_1
+        );
+        assert_eq!(
+            response_format("application/openmetrics-text"),
+            Format::OPEN_METRICS_0_0_1
+        );
+        assert_eq!(
+            response_format(FMT_OPEN_METRICS_1_0_0),
+            Format::OPEN_METRICS_1_0_0
+        );
+        assert_eq!(response_format(FMT_OPEN_METRICS_2_0_0), Format::UNKNOWN);
+        assert_eq!(
+            response_format("application/openmetrics-text; version=0.0.4"),
             Format::UNKNOWN
         );
         assert_eq!(response_format(FMT_PROTO_DELIM), Format::PROTO_DELIM);
