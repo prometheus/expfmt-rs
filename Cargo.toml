@@ -12,15 +12,15 @@ categories = ["parser-implementations", "encoding"]
 [features]
 default = ["arrow", "dto"]
 arrow = []
-dto = ["dep:prost", "dep:prost-types", "dep:prost-build"]
+dto = ["dep:prost", "dep:prost-types"]
 
 [dependencies]
 prost = { version = "0.13", optional = true }
 prost-types = { version = "0.13", optional = true }
 thiserror = "2"
 
-[build-dependencies]
-prost-build = { version = "0.13", optional = true }
+[dev-dependencies]
+prost-build = "0.13"
 
 [lints.rust]
 missing_docs = "warn"

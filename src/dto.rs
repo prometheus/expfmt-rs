@@ -12,13 +12,13 @@
 // limitations under the License.
 
 //! Prometheus `io.prometheus.client` protobuf data transfer objects (`MetricFamily` and related
-//! message types) compiled from [`metrics.proto`](https://github.com/prometheus/client_model/blob/master/io/prometheus/client/metrics.proto).
+//! message types) compiled from [`io.prometheus.client`](https://buf.build/prometheus/prometheus/docs/main%3Aio.prometheus.client)
+//! ([`prompb/io/prometheus/client/metrics.proto`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto)).
 
 /// Generated `io.prometheus.client` protobuf structs and enums.
 #[allow(missing_docs, clippy::all)]
-pub mod proto {
-    include!(concat!(env!("OUT_DIR"), "/io.prometheus.client.rs"));
-}
+#[path = "dto/io.prometheus.client.rs"]
+pub mod proto;
 
 pub use proto::{
     Bucket, BucketSpan, Counter, Exemplar, Gauge, Histogram, LabelPair, Metric, MetricFamily,
@@ -27,28 +27,65 @@ pub use proto::{
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
     use prost::Message;
 
     use super::*;
 
     #[test]
+    fn generated_proto_is_up_to_date() {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let proto_file = manifest_dir.join("proto/io/prometheus/client/metrics.proto");
+        let proto_include = manifest_dir.join("proto");
+        let checked_in_path = manifest_dir.join("src/dto/io.prometheus.client.rs");
+
+        let out_dir =
+            std::env::temp_dir().join(format!("expfmt-proto-test-{}", std::process::id()));
+        fs::create_dir_all(&out_dir).expect("temp out_dir should be created");
+
+        prost_build::Config::new()
+            .out_dir(&out_dir)
+            .compile_protos(&[&proto_file], &[&proto_include])
+            .expect("prost-build should compile metrics.proto");
+
+        let generated_path = out_dir.join("io.prometheus.client.rs");
+        let generated =
+            fs::read_to_string(&generated_path).expect("generated file should be readable");
+        let _ = fs::remove_dir_all(&out_dir);
+
+        if std::env::var_os("UPDATE_PROTO").is_some() {
+            fs::write(&checked_in_path, &generated).expect("should update checked-in proto file");
+        }
+
+        let checked_in =
+            fs::read_to_string(&checked_in_path).expect("checked-in proto file should be readable");
+        assert_eq!(
+            checked_in, generated,
+            "src/dto/io.prometheus.client.rs is out of date with proto/io/prometheus/client/metrics.proto; \
+             re-run with UPDATE_PROTO=1 cargo test"
+        );
+    }
+
+    #[test]
     fn encode_decode_length_delimited_metric_family() {
         let family = MetricFamily {
-            name: Some("http_requests_total".to_owned()),
-            help: Some("Total number of HTTP requests.".to_owned()),
-            r#type: Some(MetricType::Counter as i32),
-            unit: None,
+            name: "http_requests_total".to_owned(),
+            help: "Total number of HTTP requests.".to_owned(),
+            r#type: MetricType::Counter as i32,
+            unit: String::new(),
             metric: vec![Metric {
                 label: vec![LabelPair {
-                    name: Some("method".to_owned()),
-                    value: Some("GET".to_owned()),
+                    name: "method".to_owned(),
+                    value: "GET".to_owned(),
                 }],
                 counter: Some(Counter {
-                    value: Some(42.0),
+                    value: 42.0,
                     exemplar: None,
-                    created_timestamp: None,
+                    start_timestamp: None,
                 }),
-                timestamp_ms: Some(1_700_000_000_000),
+                timestamp_ms: 1_700_000_000_000,
                 ..Default::default()
             }],
         };
@@ -67,20 +104,20 @@ mod tests {
     #[test]
     fn encode_decode_native_histogram_fields() {
         let family = MetricFamily {
-            name: Some("request_duration_seconds".to_owned()),
-            help: Some("Request latency distribution.".to_owned()),
-            r#type: Some(MetricType::Histogram as i32),
-            unit: Some("seconds".to_owned()),
+            name: "request_duration_seconds".to_owned(),
+            help: "Request latency distribution.".to_owned(),
+            r#type: MetricType::Histogram as i32,
+            unit: "seconds".to_owned(),
             metric: vec![Metric {
                 histogram: Some(Histogram {
-                    sample_count: Some(10),
-                    sample_sum: Some(12.5),
-                    schema: Some(3),
-                    zero_threshold: Some(0.001),
-                    zero_count: Some(2),
+                    sample_count: 10,
+                    sample_sum: 12.5,
+                    schema: 3,
+                    zero_threshold: 0.001,
+                    zero_count: 2,
                     positive_span: vec![BucketSpan {
-                        offset: Some(0),
-                        length: Some(2),
+                        offset: 0,
+                        length: 2,
                     }],
                     positive_delta: vec![5, -2],
                     ..Default::default()
