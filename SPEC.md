@@ -1,6 +1,6 @@
 # `expfmt-rs` specification and implementation plan
 
-`expfmt-rs` provides official Rust decoders, and later encoders, for Prometheus and OpenMetrics wire exposition formats.
+`expfmt-rs` provides official Rust decoders for Prometheus and OpenMetrics wire exposition formats.
 
 ## Background and goals
 
