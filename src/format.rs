@@ -22,6 +22,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 /// MIME type for Prometheus classic text exposition format.
 pub const TEXT_TYPE: &str = "text/plain";
@@ -588,10 +589,38 @@ fn parse_accept(header: &str) -> Vec<AcceptClause<'_>> {
     clauses
 }
 
+static FORMAT_TO_ACCEPT: LazyLock<HashMap<&'static str, AcceptClause<'static>>> =
+    LazyLock::new(|| {
+        [
+            FMT_TEXT,
+            FMT_PROTO_DELIM,
+            FMT_PROTO_TEXT,
+            FMT_PROTO_COMPACT,
+            FMT_OPEN_METRICS_1_0_0,
+            FMT_OPEN_METRICS_2_0_0_RC,
+            FMT_OPEN_METRICS_2_0_0,
+            FMT_OPEN_METRICS_0_0_1,
+        ]
+        .into_iter()
+        .filter_map(|fmt| {
+            parse_accept(fmt)
+                .into_iter()
+                .next()
+                .map(|clause| (fmt, clause))
+        })
+        .collect()
+    });
+
 fn match_format(ac: &AcceptClause<'_>, f: &Format) -> bool {
-    let parsed = parse_accept(f.as_str());
-    let Some(target) = parsed.first() else {
-        return false;
+    let parsed;
+    let target = if let Some(cached) = FORMAT_TO_ACCEPT.get(f.as_str()) {
+        cached
+    } else {
+        parsed = parse_accept(f.as_str());
+        let Some(first) = parsed.first() else {
+            return false;
+        };
+        first
     };
 
     if ac.main_type != "*" && ac.main_type != target.main_type {
