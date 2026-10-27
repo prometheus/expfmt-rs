@@ -13,3 +13,4 @@
 
 //! Prometheus and OpenMetrics wire exposition format decoders.
 
+pub mod format;
