@@ -246,14 +246,14 @@ impl Format {
     /// `Format.FormatType()` in `prometheus/common/expfmt`.
     #[must_use]
     pub fn format_type(&self) -> FormatType {
-        let mut toks = self.0.split(';');
-        let Some(media_type) = toks.next().map(str::trim) else {
+        let mut tokens = self.0.split(';');
+        let Some(media_type) = tokens.next().map(str::trim) else {
             return FormatType::Unknown;
         };
 
         let mut params: HashMap<&str, &str> = HashMap::new();
-        for tok in toks {
-            let mut args = tok.split('=');
+        for token in tokens {
+            let mut args = token.split('=');
             let (Some(k), Some(v), None) = (args.next(), args.next(), args.next()) else {
                 continue;
             };
@@ -308,8 +308,8 @@ impl Format {
     pub fn with_escaping_scheme(&self, scheme: EscapingScheme) -> Self {
         let mut terms: Vec<String> = Vec::new();
         for p in self.0.split(';') {
-            let mut toks = p.split('=');
-            let (Some(k), Some(_), None) = (toks.next(), toks.next(), toks.next()) else {
+            let mut tokens = p.split('=');
+            let (Some(k), Some(_), None) = (tokens.next(), tokens.next(), tokens.next()) else {
                 let trimmed = p.trim();
                 if !trimmed.is_empty() {
                     terms.push(trimmed.to_owned());
@@ -339,8 +339,8 @@ impl Format {
         default_scheme: EscapingScheme,
     ) -> EscapingScheme {
         for p in self.0.split(';') {
-            let mut toks = p.split('=');
-            let (Some(k), Some(v), None) = (toks.next(), toks.next(), toks.next()) else {
+            let mut tokens = p.split('=');
+            let (Some(k), Some(v), None) = (tokens.next(), tokens.next(), tokens.next()) else {
                 continue;
             };
             if k.trim() == ESCAPING_KEY {
