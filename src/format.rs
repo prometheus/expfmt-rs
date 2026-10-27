@@ -420,7 +420,7 @@ pub fn response_format(content_type: &str) -> Format {
         return Format::UNKNOWN;
     };
 
-    match media_type {
+    match media_type.as_str() {
         PROTO_TYPE => {
             if let Some(&p) = params.get(PROTO_KEY)
                 && p != PROTO_PROTOCOL
@@ -621,7 +621,7 @@ fn match_format(ac: &AcceptClause<'_>, f: &Format) -> bool {
 }
 
 /// Minimal RFC 1521 / `mime.ParseMediaType` parser for `type/subtype; key=val` strings.
-fn parse_media_type(input: &str) -> Option<(&str, HashMap<&str, &str>)> {
+fn parse_media_type(input: &str) -> Option<(String, HashMap<String, &str>)> {
     let mut parts = input.split(';');
     let base = parts.next()?.trim();
     let (main_type, sub_type) = base.split_once('/')?;
@@ -641,9 +641,9 @@ fn parse_media_type(input: &str) -> Option<(&str, HashMap<&str, &str>)> {
         if !is_valid_token(k) || v.is_empty() {
             return None;
         }
-        params.insert(k, v);
+        params.insert(k.to_ascii_lowercase(), v);
     }
-    Some((base, params))
+    Some((base.to_ascii_lowercase(), params))
 }
 
 fn is_valid_token(s: &str) -> bool {
@@ -1073,6 +1073,8 @@ mod tests {
     fn response_format_extraction() {
         assert_eq!(response_format(FMT_TEXT), Format::TEXT);
         assert_eq!(response_format("text/plain"), Format::TEXT);
+        assert_eq!(response_format("Text/Plain"), Format::TEXT);
+        assert_eq!(response_format("Text/Plain; VERSION=0.0.4"), Format::TEXT);
         assert_eq!(
             response_format("text/plain; version=0.0.5"),
             Format::UNKNOWN
@@ -1087,6 +1089,10 @@ mod tests {
         );
         assert_eq!(
             response_format(FMT_OPEN_METRICS_1_0_0),
+            Format::OPEN_METRICS_1_0_0
+        );
+        assert_eq!(
+            response_format("Application/OpenMetrics-Text; VERSION=1.0.0"),
             Format::OPEN_METRICS_1_0_0
         );
         assert_eq!(response_format(FMT_OPEN_METRICS_2_0_0), Format::UNKNOWN);
