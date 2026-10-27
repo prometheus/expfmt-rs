@@ -443,7 +443,7 @@ pub fn response_format(content_type: &str) -> Format {
             Format::TEXT
         }
         OPEN_METRICS_TYPE => match params.get(VERSION_KEY).copied() {
-            None | Some(OPEN_METRICS_VERSION_0_0_1) => Format::OPEN_METRICS_0_0_1,
+            None | Some("") | Some(OPEN_METRICS_VERSION_0_0_1) => Format::OPEN_METRICS_0_0_1,
             Some(OPEN_METRICS_VERSION_1_0_0) => Format::OPEN_METRICS_1_0_0,
             Some(_) => Format::UNKNOWN,
         },
@@ -637,8 +637,16 @@ fn parse_media_type(input: &str) -> Option<(String, HashMap<String, &str>)> {
         }
         let (k, v) = trimmed.split_once('=')?;
         let k = k.trim();
-        let v = v.trim().trim_matches('"');
-        if !is_valid_token(k) || v.is_empty() {
+        let v = v.trim();
+        let v = if let Some(inner) = v.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            inner
+        } else {
+            if v.is_empty() || v.contains('"') {
+                return None;
+            }
+            v
+        };
+        if !is_valid_token(k) {
             return None;
         }
         params.insert(k.to_ascii_lowercase(), v);
@@ -819,6 +827,20 @@ mod tests {
             (
                 Format::OPEN_METRICS_2_0_0.with_escaping_scheme(EscapingScheme::EscapeDots),
                 "2.0.0",
+            ),
+            (
+                Format::from(
+                    "application/openmetrics-text; version=2.0.0; charset=utf-8; escaping=\"\"",
+                ),
+                "2.0.0",
+            ),
+            (
+                Format::from("application/openmetrics-text; version=\"2.0.0\"; charset=utf-8"),
+                "2.0.0",
+            ),
+            (
+                Format::from("application/openmetrics-text; version=2.0.0; escaping="),
+                "",
             ),
             (Format::PROTO_DELIM, ""),
             (Format::PROTO_TEXT, ""),
