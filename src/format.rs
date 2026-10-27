@@ -474,6 +474,9 @@ pub fn negotiate_including_open_metrics(
 
 /// Negotiates a response [`Format`] from an HTTP `Accept` header value and an ordered slice of
 /// `accepted` formats, matching `NegotiateAccept` in `prometheus/common/expfmt/encode.go`.
+///
+/// Clauses with `q=0` (or an invalid `q` weight) are treated as not acceptable per
+/// [RFC 9110 Section 12.4.2](https://www.rfc-editor.org/rfc/rfc9110#section-12.4.2) and skipped.
 #[must_use]
 pub fn negotiate_accept(
     accept_header: &str,
@@ -482,6 +485,9 @@ pub fn negotiate_accept(
 ) -> Format {
     let default_suffix = format!("; {ESCAPING_KEY}={default_escaping}");
     for ac in parse_accept(accept_header) {
+        if ac.q <= 0.0 {
+            continue;
+        }
         for f in accepted {
             if match_format(&ac, f) {
                 let suffix = escaping_for(&ac, f, default_escaping);
@@ -1048,6 +1054,22 @@ mod tests {
                     Format::TEXT,
                 ],
                 "application/openmetrics-text; version=2.0.0; charset=utf-8; escaping=allow-utf-8",
+            ),
+            (
+                "q=0 clause is skipped as not acceptable",
+                "application/vnd.google.protobuf;proto=io.prometheus.client.MetricFamily;encoding=delimited;q=0",
+                &[Format::PROTO_DELIM, Format::TEXT],
+                "text/plain; version=0.0.4; charset=utf-8; escaping=values",
+            ),
+            (
+                "q=0 clause is skipped in favor of lower-priority acceptable clause",
+                "application/openmetrics-text;version=2.0.0;q=0, application/openmetrics-text;version=1.0.0;q=0.5",
+                &[
+                    Format::OPEN_METRICS_2_0_0,
+                    Format::OPEN_METRICS_1_0_0,
+                    Format::TEXT,
+                ],
+                "application/openmetrics-text; version=1.0.0; charset=utf-8; escaping=values",
             ),
             (
                 "wildcard */* matches text format if present",
