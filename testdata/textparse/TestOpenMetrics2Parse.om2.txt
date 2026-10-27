@@ -1,0 +1,18 @@
+# HELP go_gc_duration_seconds A summary of GC invocation durations.
+# TYPE go_gc_duration_seconds summary
+# UNIT go_gc_duration_seconds seconds
+go_gc_duration_seconds {count:99,sum:0.004,quantile:[0:4.9351e-05,0.5:8.3835e-05]}
+# TYPE go_goroutines gauge
+go_goroutines 33 123456.789
+# TYPE hh histogram
+hh {count:1,sum:1.0,bucket:[+Inf:1]}
+# TYPE ii_info info
+ii_info{foo="bar"} 1
+# TYPE ss stateset
+ss{ss="foo"} 1
+ss{ss="bar"} 0
+# TYPE un unknown
+un 1
+# TYPE foo_total counter
+foo_total 17.0 1520879607.789 # {id="counter-test"} 5 1520879600.789
+# EOF

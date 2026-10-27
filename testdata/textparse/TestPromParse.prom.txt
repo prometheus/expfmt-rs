@@ -1,0 +1,44 @@
+# HELP go_gc_duration_seconds A summary of the GC invocation durations.
+# 	TYPE go_gc_duration_seconds summary
+go_gc_duration_seconds{quantile="0"} 4.9351e-05
+go_gc_duration_seconds{quantile="0.25",} 7.424100000000001e-05
+go_gc_duration_seconds{quantile="0.5",a="b"} 8.3835e-05
+go_gc_duration_seconds{quantile="0.8", a="b"} 8.3835e-05
+go_gc_duration_seconds{ quantile="0.9", a="b"} 8.3835e-05
+# HELP prometheus_http_request_duration_seconds Histogram of latencies for HTTP requests.
+# TYPE prometheus_http_request_duration_seconds histogram
+prometheus_http_request_duration_seconds_bucket{handler="/",le="1"} 423
+prometheus_http_request_duration_seconds_bucket{handler="/",le="2"} 1423
+prometheus_http_request_duration_seconds_bucket{handler="/",le="+Inf"} 1423
+prometheus_http_request_duration_seconds_sum{handler="/"} 2000
+prometheus_http_request_duration_seconds_count{handler="/"} 1423
+# Hrandom comment starting with prefix of HELP
+#
+wind_speed{A="2",c="3"} 12345
+# comment with escaped \n newline
+# comment with escaped \ escape character
+# HELP nohelp1
+# HELP nohelp2 
+go_gc_duration_seconds{ quantile="1.0", a="b" } 8.3835e-05
+go_gc_duration_seconds { quantile="1.0", a="b" } 8.3835e-05
+go_gc_duration_seconds { quantile= "1.0", a= "b", } 8.3835e-05
+go_gc_duration_seconds { quantile = "1.0", a = "b" } 8.3835e-05
+go_gc_duration_seconds { quantile = "2.0" a = "b" } 8.3835e-05
+go_gc_duration_seconds_count 99
+some:aggregate:rate5m{a_b="c"}	1
+# HELP go_goroutines Number of goroutines that currently exist.
+# TYPE go_goroutines gauge
+go_goroutines 33  	123123
+# TYPE some_counter_total counter
+# HELP some_counter_total Help after type.
+some_counter_total 12
+# HELP nohelp3
+_metric_starting_with_underscore 1
+testmetric{_label_starting_with_underscore="foo"} 1
+testmetric{label="\"bar\""} 1
+testmetric{le="10"} 1
+# HELP type_and_unit_test1 Type specified in metadata overrides.
+# TYPE type_and_unit_test1 gauge
+type_and_unit_test1{__type__="counter"} 123
+# HELP type_and_unit_test2 Type specified in label.
+type_and_unit_test2{__type__="counter"} 123
