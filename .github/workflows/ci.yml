@@ -38,3 +38,18 @@ jobs:
         run: cargo check --all-targets --all-features
       - name: Check MSRV (no default features)
         run: cargo check --all-targets --no-default-features
+
+  go-fixtures:
+    name: Go testdata sync check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tests/go-harness/go.mod
+          cache-dependency-path: tests/go-harness/go.sum
+      - name: Verify testdata is in sync with tests/go-harness/go.mod
+        run: |
+          cd tests/go-harness
+          go generate ./...
+          git diff --exit-code ../../testdata

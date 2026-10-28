@@ -1,0 +1,270 @@
+// Copyright 2026 The Prometheus Authors
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//go:generate go run ./sync_testdata.go
+
+// Command sync_testdata resolves the pinned github.com/prometheus/common and
+// github.com/prometheus/prometheus modules from go.mod, copies their expfmt and
+// model/textparse testdata files, and extracts canonical parser test inputs from
+// model/textparse/*_test.go into the repository's top-level testdata/ directory.
+package main
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+
+	_ "github.com/prometheus/common/expfmt"
+	_ "github.com/prometheus/prometheus/model/textparse"
+)
+
+type moduleInfo struct {
+	Path    string `json:"path"`
+	Version string `json:"version"`
+	Dir     string `json:"dir"`
+}
+
+type manifest struct {
+	Modules map[string]string `json:"modules"`
+	Files   []string          `json:"files"`
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "sync_testdata: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	commonMod, err := resolveModule("github.com/prometheus/common")
+	if err != nil {
+		return err
+	}
+	promMod, err := resolveModule("github.com/prometheus/prometheus")
+	if err != nil {
+		return err
+	}
+
+	outRoot := filepath.Clean(filepath.Join("..", "..", "testdata"))
+	if err := os.RemoveAll(outRoot); err != nil {
+		return fmt.Errorf("clean %s: %w", outRoot, err)
+	}
+
+	var synced []string
+
+	expfmtSrc := filepath.Join(commonMod.Dir, "expfmt", "testdata")
+	expfmtDst := filepath.Join(outRoot, "expfmt")
+	expfmtFiles, err := copyDirFiles(expfmtSrc, expfmtDst, outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, expfmtFiles...)
+
+	textparseSrc := filepath.Join(promMod.Dir, "model", "textparse", "testdata")
+	textparseDst := filepath.Join(outRoot, "textparse")
+	textparseFiles, err := copyDirFiles(textparseSrc, textparseDst, outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, textparseFiles...)
+
+	astExtracts := []struct {
+		srcFile  string
+		funcName string
+		outName  string
+	}{
+		{
+			srcFile:  filepath.Join(promMod.Dir, "model", "textparse", "promparse_test.go"),
+			funcName: "TestPromParse",
+			outName:  "TestPromParse.prom.txt",
+		},
+		{
+			srcFile:  filepath.Join(promMod.Dir, "model", "textparse", "openmetricsparse_test.go"),
+			funcName: "TestOpenMetricsParse",
+			outName:  "TestOpenMetricsParse.om.txt",
+		},
+		{
+			srcFile:  filepath.Join(promMod.Dir, "model", "textparse", "openmetrics2parse_test.go"),
+			funcName: "TestOpenMetrics2Parse",
+			outName:  "TestOpenMetrics2Parse.om2.txt",
+		},
+	}
+
+	for _, ex := range astExtracts {
+		input, err := extractFuncInputLiteral(ex.srcFile, ex.funcName)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(textparseDst, ex.outName)
+		if err := os.WriteFile(dstPath, []byte(input), 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", dstPath, err)
+		}
+		rel, err := filepath.Rel(outRoot, dstPath)
+		if err != nil {
+			return err
+		}
+		synced = append(synced, filepath.ToSlash(rel))
+	}
+
+	sort.Strings(synced)
+	m := manifest{
+		Modules: map[string]string{
+			commonMod.Path: commonMod.Version,
+			promMod.Path:   promMod.Version,
+		},
+		Files: synced,
+	}
+	manifestBytes, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	manifestBytes = append(manifestBytes, '\n')
+	if err := os.WriteFile(filepath.Join(outRoot, "manifest.json"), manifestBytes, 0o644); err != nil {
+		return fmt.Errorf("write manifest.json: %w", err)
+	}
+
+	return nil
+}
+
+func resolveModule(modPath string) (moduleInfo, error) {
+	// Ensure module source is downloaded in the local module cache.
+	dlCmd := exec.Command("go", "mod", "download", "-json", modPath)
+	var dlOut bytes.Buffer
+	dlCmd.Stdout = &dlOut
+	dlCmd.Stderr = os.Stderr
+	if err := dlCmd.Run(); err != nil {
+		return moduleInfo{}, fmt.Errorf("go mod download %s: %w", modPath, err)
+	}
+	var info moduleInfo
+	if err := json.Unmarshal(dlOut.Bytes(), &info); err != nil {
+		return moduleInfo{}, fmt.Errorf("unmarshal module info for %s: %w", modPath, err)
+	}
+	if info.Dir == "" {
+		return moduleInfo{}, fmt.Errorf("empty module dir for %s", modPath)
+	}
+	return info, nil
+}
+
+func copyDirFiles(srcDir, dstDir, outRoot string) ([]string, error) {
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
+		return nil, fmt.Errorf("mkdir %s: %w", dstDir, err)
+	}
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		return nil, fmt.Errorf("readdir %s: %w", srcDir, err)
+	}
+	var copied []string
+	for _, entry := range entries {
+		if entry.IsDir() || strings.HasPrefix(entry.Name(), "json") {
+			continue
+		}
+		srcPath := filepath.Join(srcDir, entry.Name())
+		data, err := os.ReadFile(srcPath)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", srcPath, err)
+		}
+		dstPath := filepath.Join(dstDir, entry.Name())
+		if err := os.WriteFile(dstPath, data, 0o644); err != nil {
+			return nil, fmt.Errorf("write %s: %w", dstPath, err)
+		}
+		rel, err := filepath.Rel(outRoot, dstPath)
+		if err != nil {
+			return nil, err
+		}
+		copied = append(copied, filepath.ToSlash(rel))
+	}
+	return copied, nil
+}
+
+// extractFuncInputLiteral parses srcFile with go/parser and extracts the string literal
+// assigned to `input := ...` inside funcName.
+func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
+	fset := token.NewFileSet()
+	fileNode, err := parser.ParseFile(fset, srcFile, nil, 0)
+	if err != nil {
+		return "", fmt.Errorf("parse %s: %w", srcFile, err)
+	}
+
+	for _, decl := range fileNode.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != funcName || fn.Body == nil {
+			continue
+		}
+		var extracted string
+		var found bool
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if found {
+				return false
+			}
+			assign, ok := n.(*ast.AssignStmt)
+			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+				return true
+			}
+			ident, ok := assign.Lhs[0].(*ast.Ident)
+			if !ok || ident.Name != "input" {
+				return true
+			}
+			val, ok := evalStringExpr(assign.Rhs[0])
+			if ok {
+				extracted = val
+				found = true
+				return false
+			}
+			return true
+		})
+		if found {
+			return extracted, nil
+		}
+	}
+
+	return "", fmt.Errorf("could not find input literal in %s (%s)", funcName, srcFile)
+}
+
+func evalStringExpr(expr ast.Expr) (string, bool) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.STRING {
+			return "", false
+		}
+		s, err := strconv.Unquote(e.Value)
+		if err != nil {
+			return "", false
+		}
+		return s, true
+	case *ast.BinaryExpr:
+		if e.Op != token.ADD {
+			return "", false
+		}
+		left, ok := evalStringExpr(e.X)
+		if !ok {
+			return "", false
+		}
+		right, ok := evalStringExpr(e.Y)
+		if !ok {
+			return "", false
+		}
+		return left + right, true
+	default:
+		return "", false
+	}
+}

@@ -1,0 +1,27 @@
+{
+  "modules": {
+    "github.com/prometheus/common": "v0.72.1",
+    "github.com/prometheus/prometheus": "v0.315.1"
+  },
+  "files": [
+    "expfmt/protobuf",
+    "expfmt/protobuf-multimessage",
+    "expfmt/protobuf.gz",
+    "expfmt/text",
+    "expfmt/text.gz",
+    "textparse/1histogram.om.txt",
+    "textparse/TestOpenMetrics2Parse.om2.txt",
+    "textparse/TestOpenMetricsParse.om.txt",
+    "textparse/TestPromParse.prom.txt",
+    "textparse/alltypes.237mfs.nometa.prom.txt",
+    "textparse/alltypes.237mfs.prom.txt",
+    "textparse/alltypes.5mfs.om.txt",
+    "textparse/alltypes.bench.om.txt",
+    "textparse/alltypes.bench.om2.txt",
+    "textparse/alltypes.om2.txt",
+    "textparse/ct.bench.om.txt",
+    "textparse/ct.bench.om2.txt",
+    "textparse/histograms.bench.om.txt",
+    "textparse/histograms.bench.om2.txt"
+  ]
+}
