@@ -34,7 +34,7 @@ fn quote(out: &mut Vec<u8>, bytes: &[u8]) {
 
 fn render(input: &[u8]) -> Vec<u8> {
     let mut parser = PromParser::new(input);
-    let mut buf = LabelsBuffer::new();
+    let mut labels = LabelsBuffer::new();
     let mut out = Vec::new();
     loop {
         let entry = match parser.next_entry() {
@@ -54,23 +54,23 @@ fn render(input: &[u8]) -> Vec<u8> {
                 quote(&mut out, &text);
             }
             Entry::Type => {
-                let (name, mtype) = parser.metric_type();
+                let (name, metric_type) = parser.metric_type();
                 out.extend_from_slice(b"type ");
                 quote(&mut out, name);
-                write!(out, " {}", mtype.as_str()).unwrap();
+                write!(out, " {}", metric_type.as_str()).unwrap();
             }
             Entry::Comment => {
                 out.extend_from_slice(b"comment ");
                 quote(&mut out, parser.comment());
             }
             Entry::Series => {
-                let (series, ts, val) = parser.series();
+                let (series, timestamp, value) = parser.series();
                 out.extend_from_slice(b"series ");
                 quote(&mut out, series);
-                let ts = ts.map_or("-".to_owned(), |ts| ts.to_string());
-                write!(out, " {:016x} {ts}", val.to_bits()).unwrap();
-                parser.labels(&mut buf);
-                for (name, value) in buf.iter() {
+                let timestamp = timestamp.map_or("-".to_owned(), |millis| millis.to_string());
+                write!(out, " {:016x} {timestamp}", value.to_bits()).unwrap();
+                parser.labels(&mut labels);
+                for (name, value) in labels.iter() {
                     out.push(b' ');
                     quote(&mut out, name.as_bytes());
                     out.push(b'=');

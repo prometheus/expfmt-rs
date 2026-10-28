@@ -61,7 +61,7 @@ func writePromParseExpected(outRoot string) ([]string, error) {
 func renderPromParse(data []byte) string {
 	var out strings.Builder
 	parser := textparse.NewPromParser(data, labels.NewSymbolTable(), false)
-	var lset labels.Labels
+	var labelSet labels.Labels
 	for {
 		entry, err := parser.Next()
 		if errors.Is(err, io.EOF) {
@@ -76,19 +76,19 @@ func renderPromParse(data []byte) string {
 			name, text := parser.Help()
 			fmt.Fprintf(&out, "help %s %s\n", quote(name), quote(text))
 		case textparse.EntryType:
-			name, mtype := parser.Type()
-			fmt.Fprintf(&out, "type %s %s\n", quote(name), mtype)
+			name, metricType := parser.Type()
+			fmt.Fprintf(&out, "type %s %s\n", quote(name), metricType)
 		case textparse.EntryComment:
 			fmt.Fprintf(&out, "comment %s\n", quote(parser.Comment()))
 		case textparse.EntrySeries:
-			series, ts, value := parser.Series()
+			series, timestampMillis, value := parser.Series()
 			timestamp := "-"
-			if ts != nil {
-				timestamp = strconv.FormatInt(*ts, 10)
+			if timestampMillis != nil {
+				timestamp = strconv.FormatInt(*timestampMillis, 10)
 			}
 			fmt.Fprintf(&out, "series %s %016x %s", quote(series), math.Float64bits(value), timestamp)
-			parser.Labels(&lset)
-			lset.Range(func(label labels.Label) {
+			parser.Labels(&labelSet)
+			labelSet.Range(func(label labels.Label) {
 				fmt.Fprintf(&out, " %s=%s", quote([]byte(label.Name)), quote([]byte(label.Value)))
 			})
 			out.WriteString("\n")

@@ -26,11 +26,14 @@ use super::{
 /// Go's `value.NormalNaN`, the canonical NaN bit pattern Prometheus stores.
 const NORMAL_NAN: u64 = 0x7ff8_0000_0000_0001;
 
+/// Lexer states, named after the start conditions in `promlex.l`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
     Init,
     Comment,
+    /// After `# HELP` or `# TYPE`, before the metric name.
     Meta1,
+    /// The rest of a `# HELP` or `# TYPE` line.
     Meta2,
     Labels,
     LValue,
@@ -38,6 +41,7 @@ enum State {
     Timestamp,
 }
 
+/// Lexer tokens, named after the tokens in Go's promparse.go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Token {
     Invalid,
@@ -60,7 +64,7 @@ enum Token {
     Value,
 }
 
-fn is_ws(byte: u8) -> bool {
+fn is_blank(byte: u8) -> bool {
     byte == b' ' || byte == b'\t'
 }
 
@@ -84,8 +88,8 @@ fn is_label_char(byte: u8) -> bool {
 /// were appended, like Go's `append(b, '\n')`, without copying it.
 struct Lexer<'a> {
     input: &'a [u8],
-    i: usize,
-    start: usize,
+    pos: usize,
+    token_start: usize,
     state: State,
 }
 
@@ -102,26 +106,26 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    fn cur(&self) -> u8 {
-        self.byte(self.i)
+    fn current(&self) -> u8 {
+        self.byte(self.pos)
     }
 
-    fn buf(&self) -> &'a [u8] {
+    fn token(&self) -> &'a [u8] {
         let end = self.input.len();
-        &self.input[self.start.min(end)..self.i.min(end)]
+        &self.input[self.token_start.min(end)..self.pos.min(end)]
     }
 
     // Go's lexer skips NUL bytes inside label values, help text and comments,
     // and returns 0 (EOF) past the end of the input.
     fn next(&mut self) -> u8 {
-        self.i += 1;
-        if self.i >= self.len() {
+        self.pos += 1;
+        if self.pos >= self.len() {
             return 0;
         }
-        let mut byte = self.byte(self.i);
+        let mut byte = self.byte(self.pos);
         while byte == 0 && matches!(self.state, State::LValue | State::Meta2 | State::Comment) {
-            self.i += 1;
-            byte = self.byte(self.i);
+            self.pos += 1;
+            byte = self.byte(self.pos);
         }
         byte
     }
@@ -158,7 +162,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn consume_comment(&mut self) -> Token {
-        let mut byte = self.cur();
+        let mut byte = self.current();
         loop {
             match byte {
                 0 => return Token::Eof,
@@ -172,7 +176,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn whitespace(&mut self) -> Token {
-        self.eat_after(is_ws);
+        self.eat_after(is_blank);
         Token::Whitespace
     }
 
@@ -193,12 +197,12 @@ impl<'a> Lexer<'a> {
     }
 
     fn lex(&mut self) -> Token {
-        if self.i >= self.len() {
+        if self.pos >= self.len() {
             return Token::Eof;
         }
-        self.start = self.i;
-        let byte = self.cur();
-        if is_ws(byte) && self.state != State::Meta2 {
+        self.token_start = self.pos;
+        let byte = self.current();
+        if is_blank(byte) && self.state != State::Meta2 {
             return self.whitespace();
         }
         match self.state {
@@ -218,10 +222,10 @@ impl<'a> Lexer<'a> {
             0 => Token::Eof,
             b'\n' => self.emit(State::Init, Token::Linebreak),
             b'#' => {
-                if !is_ws(self.next()) {
+                if !is_blank(self.next()) {
                     return self.consume_comment();
                 }
-                let byte = self.eat_after(is_ws);
+                let byte = self.eat_after(is_blank);
                 self.state = State::Comment;
                 self.lex_comment(byte)
             }
@@ -241,7 +245,7 @@ impl<'a> Lexer<'a> {
             b'T' => (b"YPE", Token::Type),
             _ => return self.consume_comment(),
         };
-        if rest.iter().all(|&expected| self.next() == expected) && is_ws(self.next()) {
+        if rest.iter().all(|&expected| self.next() == expected) && is_blank(self.next()) {
             self.whitespace();
             self.state = State::Meta1;
             return token;
@@ -263,8 +267,8 @@ impl<'a> Lexer<'a> {
 
     fn lex_meta2(&mut self, mut byte: u8) -> Token {
         // `[ \t]+` wins over `[^\n]*` on a tie, so trailing blanks are whitespace.
-        if is_ws(byte) {
-            byte = self.eat_after(is_ws);
+        if is_blank(byte) {
+            byte = self.eat_after(is_blank);
             if byte == 0 || byte == b'\n' {
                 return Token::Whitespace;
             }
@@ -326,10 +330,11 @@ pub struct PromParser<'a> {
     lexer: Lexer<'a>,
     series: &'a [u8],
     text: &'a [u8],
-    mtype: MetricType,
-    val: f64,
-    ts: Option<i64>,
-    start: usize,
+    /// The type from the last `# TYPE` line, which Go keeps across metric families.
+    last_type: MetricType,
+    value: f64,
+    timestamp: Option<i64>,
+    line_start: usize,
     name: Option<&'a [u8]>,
     /// Escaped label names and values, without quotes, already checked to be UTF-8.
     labels: Vec<(&'a str, &'a str)>,
@@ -341,16 +346,16 @@ impl<'a> PromParser<'a> {
         Self {
             lexer: Lexer {
                 input,
-                i: 0,
-                start: 0,
+                pos: 0,
+                token_start: 0,
                 state: State::Init,
             },
             series: b"",
             text: b"",
-            mtype: MetricType::Unknown,
-            val: 0.0,
-            ts: None,
-            start: 0,
+            last_type: MetricType::Unknown,
+            value: 0.0,
+            timestamp: None,
+            line_start: 0,
             name: None,
             labels: Vec::new(),
         }
@@ -368,7 +373,7 @@ impl<'a> PromParser<'a> {
     fn unexpected(&self, expected: &'static str) -> ParseError {
         ParseError::UnexpectedToken {
             expected,
-            offset: self.lexer.start,
+            offset: self.lexer.token_start,
         }
     }
 
@@ -376,7 +381,7 @@ impl<'a> PromParser<'a> {
         if self.next_token() != Token::MName {
             return Err(self.unexpected("expected metric name"));
         }
-        let (mut start, mut end) = (self.lexer.start, self.lexer.i);
+        let (mut start, mut end) = (self.lexer.token_start, self.lexer.pos);
         if self.lexer.input[start] == b'"' && self.lexer.input[end - 1] == b'"' {
             start += 1;
             end -= 1;
@@ -385,29 +390,15 @@ impl<'a> PromParser<'a> {
         if self.next_token() != Token::Text {
             return Err(self.unexpected("expected text"));
         }
-        let text = self.lexer.buf();
+        let text = self.lexer.token();
         self.text = text.get(1..).unwrap_or_default();
         let entry = if kind == Token::Type {
-            self.mtype = match self.text {
-                // Prometheus text spells the unknown type `untyped`.
-                b"untyped" => MetricType::Unknown,
-                text => [
-                    MetricType::Counter,
-                    MetricType::Gauge,
-                    MetricType::Histogram,
-                    MetricType::Summary,
-                ]
-                .into_iter()
-                .find(|mtype| mtype.as_str().as_bytes() == text)
-                .ok_or_else(|| {
-                    ParseError::InvalidMetricType(String::from_utf8_lossy(text).into_owned())
-                })?,
-            };
+            self.last_type = parse_metric_type(self.text)?;
             Entry::Type
         } else {
             if std::str::from_utf8(self.text).is_err() {
                 return Err(ParseError::InvalidUtf8 {
-                    offset: self.lexer.start,
+                    offset: self.lexer.token_start,
                 });
             }
             Entry::Help
@@ -416,6 +407,36 @@ impl<'a> PromParser<'a> {
             return Err(self.unexpected("expected linebreak after metadata"));
         }
         Ok(entry)
+    }
+
+    fn parse_comment(&mut self) -> Result<Entry, ParseError> {
+        self.text = self.lexer.token();
+        if self.next_token() != Token::Linebreak {
+            return Err(self.unexpected("expected linebreak after comment"));
+        }
+        Ok(Entry::Comment)
+    }
+
+    /// Parses a sample line that starts with a metric name or with `{`.
+    fn parse_series(&mut self, first: Token) -> Result<Entry, ParseError> {
+        let mut token = first;
+        if first == Token::MName {
+            // Go uses the line start, so leading blanks become part of the name.
+            self.series = self.consumed_line();
+            self.name = Some(self.series);
+            token = self.next_token();
+        }
+        if token == Token::BraceOpen {
+            self.parse_label_values()?;
+            self.series = self.consumed_line();
+            token = self.next_token();
+        }
+        self.parse_metric_suffix(token)
+    }
+
+    /// Returns the bytes of the current line that the lexer has consumed so far.
+    fn consumed_line(&self) -> &'a [u8] {
+        &self.lexer.input[self.line_start..self.lexer.pos]
     }
 
     fn parse_label_values(&mut self) -> Result<(), ParseError> {
@@ -431,7 +452,9 @@ impl<'a> PromParser<'a> {
             token = self.next_token();
             if quoted && matches!(token, Token::Comma | Token::BraceClose) {
                 if self.name.is_some() {
-                    return Err(ParseError::InvalidMetricName { offset: self.start });
+                    return Err(ParseError::InvalidMetricName {
+                        offset: self.line_start,
+                    });
                 }
                 self.name = Some(name.as_bytes());
                 if token == Token::BraceClose {
@@ -456,40 +479,42 @@ impl<'a> PromParser<'a> {
 
     /// Returns the current token as UTF-8, without its quotes when `quoted`.
     fn token_str(&self, quoted: bool) -> Result<&'a str, ParseError> {
-        let raw = self.lexer.buf();
+        let raw = self.lexer.token();
         let raw = if quoted { &raw[1..raw.len() - 1] } else { raw };
         std::str::from_utf8(raw).map_err(|_| ParseError::InvalidUtf8 {
-            offset: self.lexer.start,
+            offset: self.lexer.token_start,
         })
     }
 
     fn parse_metric_suffix(&mut self, token: Token) -> Result<Entry, ParseError> {
         if self.name.is_none() {
-            return Err(ParseError::InvalidMetricName { offset: self.start });
+            return Err(ParseError::InvalidMetricName {
+                offset: self.line_start,
+            });
         }
         if token != Token::Value {
             return Err(self.unexpected("expected value after metric"));
         }
-        let raw = self.lexer.buf();
-        let val = parse_sample_value(raw)
+        let raw = self.lexer.token();
+        let value = parse_sample_value(raw)
             .ok_or_else(|| ParseError::InvalidValue(String::from_utf8_lossy(raw).into_owned()))?;
-        self.val = if val.is_nan() {
+        self.value = if value.is_nan() {
             f64::from_bits(NORMAL_NAN)
         } else {
-            val
+            value
         };
-        self.ts = None;
+        self.timestamp = None;
         match self.next_token() {
             Token::Linebreak => {}
             Token::Timestamp => {
-                let raw = self.lexer.buf();
-                let ts = std::str::from_utf8(raw)
+                let raw = self.lexer.token();
+                let timestamp = std::str::from_utf8(raw)
                     .ok()
                     .and_then(|digits| digits.parse().ok())
                     .ok_or_else(|| {
                         ParseError::InvalidTimestamp(String::from_utf8_lossy(raw).into_owned())
                     })?;
-                self.ts = Some(ts);
+                self.timestamp = Some(timestamp);
                 if self.next_token() != Token::Linebreak {
                     return Err(self.unexpected("expected linebreak after timestamp"));
                 }
@@ -507,35 +532,15 @@ impl<'a> PromParser<'a> {
 impl<'a> Parser<'a> for PromParser<'a> {
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError> {
         loop {
-            self.start = self.lexer.i;
+            self.line_start = self.lexer.pos;
             self.name = None;
             self.labels.clear();
             let entry = match self.next_token() {
                 Token::Eof => return Ok(None),
                 Token::Linebreak => continue,
                 kind @ (Token::Help | Token::Type) => self.parse_metadata(kind),
-                Token::Comment => {
-                    self.text = self.lexer.buf();
-                    if self.next_token() != Token::Linebreak {
-                        return Err(self.unexpected("expected linebreak after comment"));
-                    }
-                    Ok(Entry::Comment)
-                }
-                first @ (Token::BraceOpen | Token::MName) => {
-                    let mut token = first;
-                    if first == Token::MName {
-                        // Go uses the line start, so leading blanks become part of the name.
-                        self.series = &self.lexer.input[self.start..self.lexer.i];
-                        self.name = Some(self.series);
-                        token = self.next_token();
-                    }
-                    if token == Token::BraceOpen {
-                        self.parse_label_values()?;
-                        self.series = &self.lexer.input[self.start..self.lexer.i];
-                        token = self.next_token();
-                    }
-                    self.parse_metric_suffix(token)
-                }
+                Token::Comment => self.parse_comment(),
+                first @ (Token::BraceOpen | Token::MName) => self.parse_series(first),
                 _ => Err(self.unexpected("expected a valid start token")),
             };
             return entry.map(Some);
@@ -547,7 +552,7 @@ impl<'a> Parser<'a> for PromParser<'a> {
     }
 
     fn metric_type(&self) -> (&'a [u8], MetricType) {
-        (self.metric_name(), self.mtype)
+        (self.metric_name(), self.last_type)
     }
 
     fn comment(&self) -> &'a [u8] {
@@ -555,7 +560,7 @@ impl<'a> Parser<'a> for PromParser<'a> {
     }
 
     fn series(&self) -> (&'a [u8], Option<i64>, f64) {
-        (self.series, self.ts, self.val)
+        (self.series, self.timestamp, self.value)
     }
 
     fn labels(&self, buf: &mut LabelsBuffer<'a>) {
@@ -565,26 +570,50 @@ impl<'a> Parser<'a> for PromParser<'a> {
         buf.push(Cow::Borrowed(METRIC_NAME_LABEL), unescape_label(name));
         for &(name, value) in &self.labels {
             let name = unescape_label(name);
-            let mut value = unescape_label(value);
-            let normalize = match self.mtype {
-                MetricType::Histogram => name == BUCKET_LABEL,
-                MetricType::Summary => name == QUANTILE_LABEL,
-                _ => false,
-            };
-            // ponytail: Go's ParseFloat also accepts hex floats here (le="0x1p3"); we leave them as is.
-            if let Some(parsed) = normalize.then(|| parse_go_float(&value)).flatten() {
-                let mut formatted = FloatBuf::default();
-                if format_openmetrics_float(parsed, &mut formatted).is_ok() {
-                    let formatted = formatted.as_str();
-                    if formatted != value {
-                        value = Cow::Owned(formatted.to_owned());
-                    }
-                }
-            }
+            let value = normalize_float_label(self.last_type, &name, unescape_label(value));
             buf.push(name, value);
         }
         buf.sort();
     }
+}
+
+/// Go's `normalizeFloatsInLabelValues`: `le` on histograms and `quantile` on summaries
+/// use OpenMetrics float formatting. Keeps `value` borrowed when it is already canonical.
+fn normalize_float_label<'v>(
+    metric_type: MetricType,
+    name: &str,
+    value: Cow<'v, str>,
+) -> Cow<'v, str> {
+    let is_float_label = match metric_type {
+        MetricType::Histogram => name == BUCKET_LABEL,
+        MetricType::Summary => name == QUANTILE_LABEL,
+        _ => false,
+    };
+    // ponytail: Go's ParseFloat also accepts hex floats here (le="0x1p3"); we leave them as is.
+    let Some(parsed) = is_float_label.then(|| parse_go_float(&value)).flatten() else {
+        return value;
+    };
+    let mut formatted = FloatBuf::default();
+    if format_openmetrics_float(parsed, &mut formatted).is_err() || formatted.as_str() == value {
+        return value;
+    }
+    Cow::Owned(formatted.as_str().to_owned())
+}
+
+/// Maps a `# TYPE` value to a [`MetricType`]. Prometheus text spells the unknown type `untyped`.
+fn parse_metric_type(text: &[u8]) -> Result<MetricType, ParseError> {
+    if text == b"untyped" {
+        return Ok(MetricType::Unknown);
+    }
+    [
+        MetricType::Counter,
+        MetricType::Gauge,
+        MetricType::Histogram,
+        MetricType::Summary,
+    ]
+    .into_iter()
+    .find(|metric_type| metric_type.as_str().as_bytes() == text)
+    .ok_or_else(|| ParseError::InvalidMetricType(String::from_utf8_lossy(text).into_owned()))
 }
 
 /// Go's `strings.Replacer` for `\\` and `\n`, plus `\"` when `quote` is set.
@@ -648,7 +677,7 @@ fn parse_go_float(text: &str) -> Option<f64> {
     if unsigned.eq_ignore_ascii_case("nan") {
         return (unsigned.len() == text.len()).then_some(f64::NAN);
     }
-    text.parse().ok().filter(|val: &f64| val.is_finite())
+    text.parse().ok().filter(|value: &f64| value.is_finite())
 }
 
 /// Go accepts `_` only between digits, like `1_000`.
@@ -687,34 +716,49 @@ impl fmt::Write for FloatBuf {
 }
 
 /// Go's `labels.FormatOpenMetricsFloat`: `strconv.FormatFloat(v, 'g', -1, 64)` plus `.0`.
-fn format_openmetrics_float(val: f64, out: &mut FloatBuf) -> fmt::Result {
-    match val {
+fn format_openmetrics_float(value: f64, out: &mut FloatBuf) -> fmt::Result {
+    match value {
         0.0 => return out.write_str("0.0"),
-        _ if val.is_nan() => return out.write_str("NaN"),
+        _ if value.is_nan() => return out.write_str("NaN"),
         f64::INFINITY => return out.write_str("+Inf"),
         f64::NEG_INFINITY => return out.write_str("-Inf"),
         _ => {}
     }
-    let mut scientific = FloatBuf::default();
-    write!(scientific, "{val:e}")?;
-    // Go picks the correctly rounded digits among the shortest forms, Rust may not,
-    // so keep Rust's shortest digit count and round again to it.
-    let mantissa_digits = scientific.as_str().split('e').next().unwrap_or_default();
-    let precision = mantissa_digits.bytes().filter(u8::is_ascii_digit).count() - 1;
-    scientific = FloatBuf::default();
-    write!(scientific, "{val:.precision$e}")?;
+    let scientific = go_shortest_scientific(value)?;
     let (mantissa, exp) = scientific.as_str().split_once('e').ok_or(fmt::Error)?;
     let exp: i32 = exp.parse().map_err(|_| fmt::Error)?;
-    let (sign, mantissa) = match mantissa.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", mantissa),
+    let mantissa = match mantissa.strip_prefix('-') {
+        Some(unsigned) => {
+            out.write_str("-")?;
+            unsigned
+        }
+        None => mantissa,
     };
-    out.write_str(sign)?;
     // Shortest 'g' switches to exponent form when exp < -4 || exp >= 6.
-    if !(-4..6).contains(&exp) {
+    if (-4..6).contains(&exp) {
+        write_positional(mantissa, exp, out)?;
+    } else {
         let exp_sign = if exp < 0 { '-' } else { '+' };
-        return write!(out, "{mantissa}e{exp_sign}{:02}", exp.abs());
+        write!(out, "{mantissa}e{exp_sign}{:02}", exp.abs())?;
     }
+    Ok(())
+}
+
+/// Formats `value` like `{:e}` with the digits Go's `strconv.FormatFloat(v, 'e', -1, 64)` picks.
+fn go_shortest_scientific(value: f64) -> Result<FloatBuf, fmt::Error> {
+    let mut shortest = FloatBuf::default();
+    write!(shortest, "{value:e}")?;
+    // Go picks the correctly rounded digits among the shortest forms, Rust may not,
+    // so keep Rust's shortest digit count and round again to it.
+    let mantissa = shortest.as_str().split('e').next().unwrap_or_default();
+    let precision = mantissa.bytes().filter(u8::is_ascii_digit).count() - 1;
+    let mut rounded = FloatBuf::default();
+    write!(rounded, "{value:.precision$e}")?;
+    Ok(rounded)
+}
+
+/// Writes an unsigned mantissa such as `1.2345` with exponent `exp` as `12345.0` or `0.00012345`.
+fn write_positional(mantissa: &str, exp: i32, out: &mut FloatBuf) -> fmt::Result {
     let mut digits = mantissa.bytes().filter(|byte| *byte != b'.');
     if exp < 0 {
         out.write_str("0.")?;
