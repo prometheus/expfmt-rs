@@ -27,36 +27,33 @@ import (
 	"github.com/prometheus/prometheus/model/textparse"
 )
 
-// promParseInputs are the Prometheus text fixtures, relative to testdata/, that
-// tests/promparse_go_diff.rs parses and compares against the Go output.
-var promParseInputs = []struct {
-	input  string
-	output string
-}{
-	{"textparse/TestPromParse.prom.txt", "TestPromParse.prom.txt.txt"},
-	{"textparse/alltypes.237mfs.prom.txt", "alltypes.237mfs.prom.txt.txt"},
-	{"textparse/alltypes.237mfs.nometa.prom.txt", "alltypes.237mfs.nometa.prom.txt.txt"},
-	{"expfmt/text", "expfmt_text.txt"},
+// promParseInputs are the Prometheus text fixtures, relative to testdata/. Each
+// output is written to testdata/promparse/ under the same relative path, which is
+// how tests/promparse_go_diff.rs finds the input for each expected file.
+var promParseInputs = []string{
+	"textparse/TestPromParse.prom.txt",
+	"textparse/alltypes.237mfs.prom.txt",
+	"textparse/alltypes.237mfs.nometa.prom.txt",
+	"expfmt/text",
 }
 
 // writePromParseExpected runs textparse.NewPromParser on each input and writes
 // one line per entry to testdata/promparse/.
 func writePromParseExpected(outRoot string) ([]string, error) {
-	dstDir := filepath.Join(outRoot, "promparse")
-	if err := os.MkdirAll(dstDir, 0o755); err != nil {
-		return nil, fmt.Errorf("mkdir %s: %w", dstDir, err)
-	}
 	var written []string
-	for _, in := range promParseInputs {
-		data, err := os.ReadFile(filepath.Join(outRoot, in.input))
+	for _, input := range promParseInputs {
+		data, err := os.ReadFile(filepath.Join(outRoot, input))
 		if err != nil {
-			return nil, fmt.Errorf("read %s: %w", in.input, err)
+			return nil, fmt.Errorf("read %s: %w", input, err)
 		}
-		dstPath := filepath.Join(dstDir, in.output)
+		dstPath := filepath.Join(outRoot, "promparse", input)
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
+			return nil, fmt.Errorf("mkdir %s: %w", filepath.Dir(dstPath), err)
+		}
 		if err := os.WriteFile(dstPath, []byte(renderPromParse(data)), 0o644); err != nil {
 			return nil, fmt.Errorf("write %s: %w", dstPath, err)
 		}
-		written = append(written, "promparse/"+in.output)
+		written = append(written, "promparse/"+input)
 	}
 	return written, nil
 }
@@ -89,7 +86,7 @@ func renderPromParse(data []byte) string {
 			if ts != nil {
 				timestamp = strconv.FormatInt(*ts, 10)
 			}
-			fmt.Fprintf(&out, "series %s %s %s", quote(series), formatValue(value), timestamp)
+			fmt.Fprintf(&out, "series %s %016x %s", quote(series), math.Float64bits(value), timestamp)
 			parser.Labels(&lset)
 			lset.Range(func(label labels.Label) {
 				fmt.Fprintf(&out, " %s=%s", quote([]byte(label.Name)), quote([]byte(label.Value)))
@@ -117,16 +114,4 @@ func quote(raw []byte) string {
 	}
 	out.WriteByte('"')
 	return out.String()
-}
-
-func formatValue(value float64) string {
-	switch {
-	case math.IsNaN(value):
-		return "NaN"
-	case math.IsInf(value, 1):
-		return "+Inf"
-	case math.IsInf(value, -1):
-		return "-Inf"
-	}
-	return strconv.FormatFloat(value, 'e', -1, 64)
 }

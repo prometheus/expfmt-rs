@@ -94,7 +94,7 @@ pub trait Parser<'a> {
     fn start_timestamp(&self) -> Option<i64>;
 
     /// Populates the caller's reusable label buffer for the current sample.
-    fn labels(&self, buf: &mut LabelsBuffer<'a>) -> Result<(), ParseError>;
+    fn labels(&self, buf: &mut LabelsBuffer<'a>);
 
     /// Iterates over exemplars attached to the current sample.
     fn exemplars(&self, buf: &mut ExemplarsBuffer<'a>) -> Result<(), ParseError>;

@@ -18,7 +18,10 @@
 use std::borrow::Cow;
 use std::fmt::{self, Write};
 
-use super::{Entry, LabelsBuffer, METRIC_NAME_LABEL, MetricType, ParseError, Parser};
+use super::{
+    BUCKET_LABEL, Entry, LabelsBuffer, METRIC_NAME_LABEL, MetricType, ParseError, Parser,
+    QUANTILE_LABEL,
+};
 
 /// Go's `value.NormalNaN`, the canonical NaN bit pattern Prometheus stores.
 const NORMAL_NAN: u64 = 0x7ff8_0000_0000_0001;
@@ -69,6 +72,14 @@ fn is_label_start(byte: u8) -> bool {
     byte.is_ascii_alphabetic() || byte == b'_'
 }
 
+fn is_name_char(byte: u8) -> bool {
+    is_name_start(byte) || byte.is_ascii_digit()
+}
+
+fn is_label_char(byte: u8) -> bool {
+    is_label_start(byte) || byte.is_ascii_digit()
+}
+
 /// Hand-written port of the `promlex.l` rules. The input behaves as if a `\n`
 /// were appended, like Go's `append(b, '\n')`, without copying it.
 struct Lexer<'a> {
@@ -107,12 +118,12 @@ impl<'a> Lexer<'a> {
         if self.i >= self.len() {
             return 0;
         }
-        while self.byte(self.i) == 0
-            && matches!(self.state, State::LValue | State::Meta2 | State::Comment)
-        {
+        let mut byte = self.byte(self.i);
+        while byte == 0 && matches!(self.state, State::LValue | State::Meta2 | State::Comment) {
             self.i += 1;
+            byte = self.byte(self.i);
         }
-        self.byte(self.i)
+        byte
     }
 
     fn eat_while(&mut self, mut byte: u8, pred: impl Fn(u8) -> bool) -> u8 {
@@ -120,6 +131,11 @@ impl<'a> Lexer<'a> {
             byte = self.next();
         }
         byte
+    }
+
+    fn eat_after(&mut self, pred: impl Fn(u8) -> bool) -> u8 {
+        let next = self.next();
+        self.eat_while(next, pred)
     }
 
     /// Consumes `"(\\.|[^\\"])*"` starting at the opening quote.
@@ -156,8 +172,7 @@ impl<'a> Lexer<'a> {
     }
 
     fn whitespace(&mut self) -> Token {
-        let next = self.next();
-        self.eat_while(next, is_ws);
+        self.eat_after(is_ws);
         Token::Whitespace
     }
 
@@ -168,6 +183,9 @@ impl<'a> Lexer<'a> {
         let mut byte = self.cur();
         self.start = self.i;
         loop {
+            if is_ws(byte) && self.state != State::Meta2 {
+                return self.whitespace();
+            }
             return match self.state {
                 State::Init => match byte {
                     0 => Token::Eof,
@@ -175,14 +193,12 @@ impl<'a> Lexer<'a> {
                         self.next();
                         Token::Linebreak
                     }
-                    b' ' | b'\t' => self.whitespace(),
                     b'#' => {
                         let next = self.next();
                         if !is_ws(next) {
                             return self.consume_comment();
                         }
-                        let next = self.next();
-                        byte = self.eat_while(next, is_ws);
+                        byte = self.eat_after(is_ws);
                         self.state = State::Comment;
                         continue;
                     }
@@ -192,10 +208,7 @@ impl<'a> Lexer<'a> {
                         Token::BraceOpen
                     }
                     _ if is_name_start(byte) => {
-                        let next = self.next();
-                        self.eat_while(next, |next_byte| {
-                            is_name_start(next_byte) || next_byte.is_ascii_digit()
-                        });
+                        self.eat_after(is_name_char);
                         self.state = State::Value;
                         Token::MName
                     }
@@ -217,7 +230,6 @@ impl<'a> Lexer<'a> {
                         }
                         self.consume_comment()
                     }
-                    b' ' | b'\t' => self.whitespace(),
                     _ => self.consume_comment(),
                 },
                 State::Meta1 => match byte {
@@ -228,12 +240,8 @@ impl<'a> Lexer<'a> {
                         self.state = State::Meta2;
                         Token::MName
                     }
-                    b' ' | b'\t' => self.whitespace(),
                     _ if is_name_start(byte) => {
-                        let next = self.next();
-                        self.eat_while(next, |next_byte| {
-                            is_name_start(next_byte) || next_byte.is_ascii_digit()
-                        });
+                        self.eat_after(is_name_char);
                         self.state = State::Meta2;
                         Token::MName
                     }
@@ -242,8 +250,7 @@ impl<'a> Lexer<'a> {
                 State::Meta2 => {
                     // `[ \t]+` wins over `[^\n]*` on a tie, so trailing blanks are whitespace.
                     if is_ws(byte) {
-                        let next = self.next();
-                        byte = self.eat_while(next, is_ws);
+                        byte = self.eat_after(is_ws);
                         if byte == 0 || byte == b'\n' {
                             return Token::Whitespace;
                         }
@@ -273,12 +280,8 @@ impl<'a> Lexer<'a> {
                         self.state = State::Value;
                         Token::BraceClose
                     }
-                    b' ' | b'\t' => self.whitespace(),
                     _ if is_label_start(byte) => {
-                        let next = self.next();
-                        self.eat_while(next, |next_byte| {
-                            is_label_start(next_byte) || next_byte.is_ascii_digit()
-                        });
+                        self.eat_after(is_label_char);
                         Token::LName
                     }
                     _ => Token::Invalid,
@@ -291,11 +294,9 @@ impl<'a> Lexer<'a> {
                         self.state = State::Labels;
                         Token::LValue
                     }
-                    b' ' | b'\t' => self.whitespace(),
                     _ => Token::Invalid,
                 },
                 State::Value => match byte {
-                    b' ' | b'\t' => self.whitespace(),
                     b'{' => {
                         self.next();
                         self.state = State::Labels;
@@ -303,8 +304,7 @@ impl<'a> Lexer<'a> {
                     }
                     0 | b'\n' => Token::Invalid,
                     _ => {
-                        let next = self.next();
-                        self.eat_while(next, |next_byte| {
+                        self.eat_after(|next_byte| {
                             !matches!(next_byte, 0 | b'\n' | b' ' | b'\t' | b'{')
                         });
                         self.state = State::Timestamp;
@@ -317,10 +317,8 @@ impl<'a> Lexer<'a> {
                         self.state = State::Init;
                         Token::Linebreak
                     }
-                    b' ' | b'\t' => self.whitespace(),
                     b'0'..=b'9' => {
-                        let next = self.next();
-                        self.eat_while(next, |next_byte| next_byte.is_ascii_digit());
+                        self.eat_after(|next_byte| next_byte.is_ascii_digit());
                         Token::Timestamp
                     }
                     _ => Token::Invalid,
@@ -341,8 +339,9 @@ pub struct PromParser<'a> {
     val: f64,
     ts: Option<i64>,
     start: usize,
-    name: Option<(usize, usize)>,
-    labels: Vec<[usize; 4]>,
+    name: Option<&'a [u8]>,
+    /// Escaped label names and values, without quotes, already checked to be UTF-8.
+    labels: Vec<(&'a str, &'a str)>,
 }
 
 impl<'a> PromParser<'a> {
@@ -391,7 +390,7 @@ impl<'a> PromParser<'a> {
             start += 1;
             end -= 1;
         }
-        self.name = Some((start, end));
+        self.name = Some(&self.lexer.input[start..end]);
         if self.next_token() != Token::Text {
             return Err(self.unexpected("expected text"));
         }
@@ -399,16 +398,19 @@ impl<'a> PromParser<'a> {
         self.text = text.get(1..).unwrap_or_default();
         let entry = if kind == Token::Type {
             self.mtype = match self.text {
-                b"counter" => MetricType::Counter,
-                b"gauge" => MetricType::Gauge,
-                b"histogram" => MetricType::Histogram,
-                b"summary" => MetricType::Summary,
+                // Prometheus text spells the unknown type `untyped`.
                 b"untyped" => MetricType::Unknown,
-                other => {
-                    return Err(ParseError::InvalidMetricType(
-                        String::from_utf8_lossy(other).into_owned(),
-                    ));
-                }
+                text => [
+                    MetricType::Counter,
+                    MetricType::Gauge,
+                    MetricType::Histogram,
+                    MetricType::Summary,
+                ]
+                .into_iter()
+                .find(|mtype| mtype.as_str().as_bytes() == text)
+                .ok_or_else(|| {
+                    ParseError::InvalidMetricType(String::from_utf8_lossy(text).into_owned())
+                })?,
             };
             Entry::Type
         } else {
@@ -428,31 +430,24 @@ impl<'a> PromParser<'a> {
     fn parse_label_values(&mut self) -> Result<(), ParseError> {
         let mut token = self.next_token();
         loop {
-            let (mut name_start, mut name_end) = (self.lexer.start, self.lexer.i);
             let quoted = match token {
                 Token::BraceClose => return Ok(()),
                 Token::LName => false,
                 Token::QString => true,
                 _ => return Err(self.unexpected("expected label name")),
             };
-            if quoted && std::str::from_utf8(self.lexer.buf()).is_err() {
-                return Err(ParseError::InvalidUtf8 { offset: name_start });
-            }
+            let name = self.token_str(quoted)?;
             token = self.next_token();
             if quoted && matches!(token, Token::Comma | Token::BraceClose) {
                 if self.name.is_some() {
                     return Err(ParseError::InvalidMetricName { offset: self.start });
                 }
-                self.name = Some((name_start + 1, name_end - 1));
+                self.name = Some(name.as_bytes());
                 if token == Token::BraceClose {
                     return Ok(());
                 }
                 token = self.next_token();
                 continue;
-            }
-            if quoted {
-                name_start += 1;
-                name_end -= 1;
             }
             if token != Token::Equal {
                 return Err(self.unexpected("expected equal"));
@@ -460,18 +455,21 @@ impl<'a> PromParser<'a> {
             if self.next_token() != Token::LValue {
                 return Err(self.unexpected("expected label value"));
             }
-            if std::str::from_utf8(self.lexer.buf()).is_err() {
-                return Err(ParseError::InvalidUtf8 {
-                    offset: self.lexer.start,
-                });
-            }
-            self.labels
-                .push([name_start, name_end, self.lexer.start + 1, self.lexer.i - 1]);
+            self.labels.push((name, self.token_str(true)?));
             token = self.next_token();
             if token == Token::Comma {
                 token = self.next_token();
             }
         }
+    }
+
+    /// Returns the current token as UTF-8, without its quotes when `quoted`.
+    fn token_str(&self, quoted: bool) -> Result<&'a str, ParseError> {
+        let raw = self.lexer.buf();
+        let raw = if quoted { &raw[1..raw.len() - 1] } else { raw };
+        std::str::from_utf8(raw).map_err(|_| ParseError::InvalidUtf8 {
+            offset: self.lexer.start,
+        })
     }
 
     fn parse_metric_suffix(&mut self, token: Token) -> Result<Entry, ParseError> {
@@ -510,12 +508,8 @@ impl<'a> PromParser<'a> {
         Ok(Entry::Series)
     }
 
-    fn label_str(&self, start: usize, end: usize, quote: bool) -> Result<Cow<'a, str>, ParseError> {
-        let invalid = ParseError::InvalidUtf8 { offset: start };
-        Ok(match unescape(&self.lexer.input[start..end], quote) {
-            Cow::Borrowed(raw) => Cow::Borrowed(std::str::from_utf8(raw).map_err(|_| invalid)?),
-            Cow::Owned(raw) => Cow::Owned(String::from_utf8(raw).map_err(|_| invalid)?),
-        })
+    fn metric_name(&self) -> &'a [u8] {
+        self.name.unwrap_or_default()
     }
 }
 
@@ -536,17 +530,14 @@ impl<'a> Parser<'a> for PromParser<'a> {
                     }
                     Ok(Entry::Comment)
                 }
-                Token::BraceOpen => {
-                    self.parse_label_values()?;
-                    self.series = &self.lexer.input[self.start..self.lexer.i];
-                    let token = self.next_token();
-                    self.parse_metric_suffix(token)
-                }
-                Token::MName => {
-                    // Go uses the line start, so leading blanks become part of the name.
-                    self.name = Some((self.start, self.lexer.i));
-                    self.series = &self.lexer.input[self.start..self.lexer.i];
-                    let mut token = self.next_token();
+                first @ (Token::BraceOpen | Token::MName) => {
+                    let mut token = first;
+                    if first == Token::MName {
+                        // Go uses the line start, so leading blanks become part of the name.
+                        self.series = &self.lexer.input[self.start..self.lexer.i];
+                        self.name = Some(self.series);
+                        token = self.next_token();
+                    }
                     if token == Token::BraceOpen {
                         self.parse_label_values()?;
                         self.series = &self.lexer.input[self.start..self.lexer.i];
@@ -576,44 +567,32 @@ impl<'a> Parser<'a> for PromParser<'a> {
         (self.series, self.ts, self.val)
     }
 
-    fn labels(&self, buf: &mut LabelsBuffer<'a>) -> Result<(), ParseError> {
+    fn labels(&self, buf: &mut LabelsBuffer<'a>) {
         buf.clear();
-        let (start, end) = self.name.unwrap_or_default();
-        buf.push(
-            Cow::Borrowed(METRIC_NAME_LABEL),
-            self.label_str(start, end, true)?,
-        );
-        for &[name_start, name_end, value_start, value_end] in &self.labels {
-            let name = self.label_str(name_start, name_end, true)?;
-            let mut value = self.label_str(value_start, value_end, true)?;
+        // next_entry() already checked that a series name is UTF-8.
+        let name = std::str::from_utf8(self.metric_name()).unwrap_or_default();
+        buf.push(Cow::Borrowed(METRIC_NAME_LABEL), unescape_label(name));
+        for &(name, value) in &self.labels {
+            let name = unescape_label(name);
+            let mut value = unescape_label(value);
             let normalize = match self.mtype {
-                MetricType::Histogram => name == "le",
-                MetricType::Summary => name == "quantile",
+                MetricType::Histogram => name == BUCKET_LABEL,
+                MetricType::Summary => name == QUANTILE_LABEL,
                 _ => false,
             };
             // ponytail: Go's ParseFloat also accepts hex floats here (le="0x1p3"); we leave them as is.
-            if let Some(parsed) = normalize
-                .then(|| parse_go_float(value.as_bytes()))
-                .flatten()
-            {
+            if let Some(parsed) = normalize.then(|| parse_go_float(&value)).flatten() {
                 let mut formatted = FloatBuf::default();
-                if format_openmetrics_float(parsed, &mut formatted).is_ok()
-                    && formatted.as_str() != value
-                {
-                    value = Cow::Owned(formatted.as_str().to_owned());
+                if format_openmetrics_float(parsed, &mut formatted).is_ok() {
+                    let formatted = formatted.as_str();
+                    if formatted != value {
+                        value = Cow::Owned(formatted.to_owned());
+                    }
                 }
             }
             buf.push(name, value);
         }
         buf.sort();
-        Ok(())
-    }
-}
-
-impl<'a> PromParser<'a> {
-    fn metric_name(&self) -> &'a [u8] {
-        let (start, end) = self.name.unwrap_or_default();
-        &self.lexer.input[start..end]
     }
 }
 
@@ -640,29 +619,45 @@ fn unescape(raw: &[u8], quote: bool) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
+fn unescape_label(raw: &str) -> Cow<'_, str> {
+    match unescape(raw.as_bytes(), true) {
+        Cow::Borrowed(_) => Cow::Borrowed(raw),
+        // Replacing ASCII escapes keeps valid UTF-8 valid, so nothing is lost here.
+        Cow::Owned(bytes) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+    }
+}
+
 /// Go's `parseFloat` in promparse.go, which rejects `pP_` before `strconv.ParseFloat`.
 fn parse_sample_value(raw: &[u8]) -> Option<f64> {
     if raw.iter().any(|byte| matches!(byte, b'p' | b'P' | b'_')) {
         return None;
     }
-    parse_go_float(raw)
+    parse_go_float(std::str::from_utf8(raw).ok()?)
 }
 
 /// Go's `strconv.ParseFloat(s, 64)`, without hex float support.
-fn parse_go_float(raw: &[u8]) -> Option<f64> {
-    let text = std::str::from_utf8(raw).ok()?;
-    if text.contains('_') {
-        return underscores_ok(raw)
-            .then(|| parse_go_float(text.replace('_', "").as_bytes()))
-            .flatten();
+fn parse_go_float(text: &str) -> Option<f64> {
+    let text = if text.contains('_') {
+        if !underscores_ok(text.as_bytes()) {
+            return None;
+        }
+        Cow::Owned(text.replace('_', ""))
+    } else {
+        Cow::Borrowed(text)
+    };
+    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(&text);
+    if unsigned.eq_ignore_ascii_case("inf") || unsigned.eq_ignore_ascii_case("infinity") {
+        return Some(if text.starts_with('-') {
+            f64::NEG_INFINITY
+        } else {
+            f64::INFINITY
+        });
     }
-    let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
-    let special = unsigned.starts_with(|c: char| c.is_ascii_alphabetic());
-    let val: f64 = text.parse().ok()?;
     // Go rejects a signed NaN, and reports overflow to infinity as an error.
-    let signed_nan = val.is_nan() && unsigned.len() != text.len();
-    let overflow = val.is_infinite() && !special;
-    (!signed_nan && !overflow).then_some(val)
+    if unsigned.eq_ignore_ascii_case("nan") {
+        return (unsigned.len() == text.len()).then_some(f64::NAN);
+    }
+    text.parse().ok().filter(|val: &f64| val.is_finite())
 }
 
 /// Go accepts `_` only between digits, like `1_000`.
@@ -784,7 +779,7 @@ mod tests {
                 Entry::Comment => Got::Comment(lossy(parser.comment())),
                 _ => {
                     let (series, ts, val) = parser.series();
-                    parser.labels(&mut buf)?;
+                    parser.labels(&mut buf);
                     let labels = buf
                         .iter()
                         .map(|(name, value)| (name.to_owned(), value.to_owned()))
@@ -973,13 +968,13 @@ mod tests {
             ("1e1_0", 1e10),
         ];
         for (text, want) in ok {
-            assert_eq!(parse_go_float(text.as_bytes()), Some(want), "{text}");
+            assert_eq!(parse_go_float(text), Some(want), "{text}");
         }
-        assert!(parse_go_float(b"nan").unwrap().is_nan());
+        assert!(parse_go_float("nan").unwrap().is_nan());
         for text in [
             ".", "1e", "infin", "+NaN", "-nan", "1e400", "0x10", "+", "e5", "1__0", "_1", "1_",
         ] {
-            assert_eq!(parse_go_float(text.as_bytes()), None, "{text}");
+            assert_eq!(parse_go_float(text), None, "{text}");
         }
     }
 

@@ -23,6 +23,12 @@ pub use promparse::PromParser;
 /// Label name under which [`Parser::labels`] stores the metric name.
 pub const METRIC_NAME_LABEL: &str = "__name__";
 
+/// Label name for the upper bound of a classic histogram bucket, Go's `model.BucketLabel`.
+pub const BUCKET_LABEL: &str = "le";
+
+/// Label name for the quantile of a summary sample, Go's `model.QuantileLabel`.
+pub const QUANTILE_LABEL: &str = "quantile";
+
 /// Kind of the entry the parser is positioned on after [`Parser::next_entry`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -54,6 +60,19 @@ pub enum MetricType {
     Histogram,
     /// `summary`.
     Summary,
+}
+
+impl MetricType {
+    /// Returns Go's `model.MetricType` string, for example `"counter"` or `"unknown"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Counter => "counter",
+            Self::Gauge => "gauge",
+            Self::Histogram => "histogram",
+            Self::Summary => "summary",
+        }
+    }
 }
 
 /// Error returned by [`Parser`] implementations.
@@ -122,7 +141,7 @@ impl<'a> LabelsBuffer<'a> {
 
     /// Sorts the labels by name.
     pub fn sort(&mut self) {
-        self.labels.sort_by(|a, b| a.0.cmp(&b.0));
+        self.labels.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     }
 
     /// Returns the value of the label `name`, if present.
@@ -168,5 +187,5 @@ pub trait Parser<'a> {
     /// Clears `buf` and fills it with the current sample's labels, sorted by name, matching Go:
     /// the metric name is stored under [`METRIC_NAME_LABEL`], and `le` on histograms and
     /// `quantile` on summaries use OpenMetrics float formatting.
-    fn labels(&self, buf: &mut LabelsBuffer<'a>) -> Result<(), ParseError>;
+    fn labels(&self, buf: &mut LabelsBuffer<'a>);
 }

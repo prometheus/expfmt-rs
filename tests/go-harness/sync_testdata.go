@@ -36,7 +36,6 @@ import (
 	"strings"
 
 	_ "github.com/prometheus/common/expfmt"
-	_ "github.com/prometheus/prometheus/model/textparse"
 )
 
 type moduleInfo struct {
