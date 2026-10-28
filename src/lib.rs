@@ -16,3 +16,4 @@
 #[cfg(feature = "dto")]
 pub mod dto;
 pub mod format;
+pub mod textparse;
