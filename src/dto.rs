@@ -15,10 +15,9 @@
 //! message types) compiled from [`io.prometheus.client`](https://buf.build/prometheus/prometheus/docs/main%3Aio.prometheus.client)
 //! ([`prompb/io/prometheus/client/metrics.proto`](https://github.com/prometheus/prometheus/blob/main/prompb/io/prometheus/client/metrics.proto)).
 
-/// Generated `io.prometheus.client` protobuf structs and enums.
 #[allow(missing_docs, clippy::all)]
 #[path = "dto/io.prometheus.client.rs"]
-pub mod proto;
+mod proto;
 
 pub use proto::{
     Bucket, BucketSpan, Counter, Exemplar, Gauge, Histogram, LabelPair, Metric, MetricFamily,
