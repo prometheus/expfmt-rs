@@ -140,20 +140,20 @@ impl fmt::Display for EscapingScheme {
     }
 }
 
-/// Error returned when an `escaping=...` parameter does not match a known [`EscapingScheme`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnknownEscapingSchemeError(pub String);
+/// Error returned by format parsing and construction helpers.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum FormatError {
+    /// An `escaping=...` parameter does not match a known [`EscapingScheme`].
+    #[error("unknown escaping scheme: {0}")]
+    UnknownEscapingScheme(String),
 
-impl fmt::Display for UnknownEscapingSchemeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown escaping scheme: {}", self.0)
-    }
+    /// An OpenMetrics version string passed to [`Format::new_open_metrics`] is not supported.
+    #[error("unknown open metrics version string: {0}")]
+    UnknownOpenMetricsVersion(String),
 }
 
-impl std::error::Error for UnknownEscapingSchemeError {}
-
 impl FromStr for EscapingScheme {
-    type Err = UnknownEscapingSchemeError;
+    type Err = FormatError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
@@ -161,7 +161,7 @@ impl FromStr for EscapingScheme {
             ESCAPE_UNDERSCORES => Ok(Self::EscapeUnderscores),
             ESCAPE_DOTS => Ok(Self::EscapeDots),
             ESCAPE_VALUES => Ok(Self::EscapeValues),
-            other => Err(UnknownEscapingSchemeError(other.to_owned())),
+            other => Err(FormatError::UnknownEscapingScheme(other.to_owned())),
         }
     }
 }
@@ -183,18 +183,6 @@ pub enum FormatType {
     /// OpenMetrics text (`application/openmetrics-text`).
     OpenMetrics,
 }
-
-/// Error returned by [`Format::new_open_metrics`] for an unsupported OpenMetrics version string.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct UnknownOpenMetricsVersionError(pub String);
-
-impl fmt::Display for UnknownOpenMetricsVersionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "unknown open metrics version string: {}", self.0)
-    }
-}
-
-impl std::error::Error for UnknownOpenMetricsVersionError {}
 
 /// HTTP `Content-Type` representation of a Prometheus or OpenMetrics wire protocol.
 ///
@@ -245,13 +233,13 @@ impl Format {
     }
 
     /// Returns the baseline OpenMetrics [`Format`] for the given version string.
-    pub fn new_open_metrics(version: &str) -> Result<Self, UnknownOpenMetricsVersionError> {
+    pub fn new_open_metrics(version: &str) -> Result<Self, FormatError> {
         match version {
             OPEN_METRICS_VERSION_0_0_1 => Ok(Self::OPEN_METRICS_0_0_1),
             OPEN_METRICS_VERSION_1_0_0 => Ok(Self::OPEN_METRICS_1_0_0),
             OPEN_METRICS_VERSION_2_0_0_RC => Ok(Self::OPEN_METRICS_2_0_0_RC),
             OPEN_METRICS_VERSION_2_0_0 => Ok(Self::OPEN_METRICS_2_0_0),
-            other => Err(UnknownOpenMetricsVersionError(other.to_owned())),
+            other => Err(FormatError::UnknownOpenMetricsVersion(other.to_owned())),
         }
     }
 
@@ -1176,5 +1164,22 @@ mod tests {
         assert_eq!(response_format(FMT_PROTO_DELIM), Format::PROTO_DELIM);
         assert_eq!(response_format(FMT_PROTO_TEXT), Format::UNKNOWN);
         assert_eq!(response_format("invalid"), Format::UNKNOWN);
+    }
+
+    #[test]
+    fn format_errors() {
+        let err = "bogus".parse::<EscapingScheme>().unwrap_err();
+        assert_eq!(err, FormatError::UnknownEscapingScheme("bogus".to_owned()));
+        assert_eq!(err.to_string(), "unknown escaping scheme: bogus");
+
+        let err = Format::new_open_metrics("9.9.9").unwrap_err();
+        assert_eq!(
+            err,
+            FormatError::UnknownOpenMetricsVersion("9.9.9".to_owned())
+        );
+        assert_eq!(
+            err.to_string(),
+            "unknown open metrics version string: 9.9.9"
+        );
     }
 }
