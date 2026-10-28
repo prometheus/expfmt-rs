@@ -15,12 +15,12 @@ arrow = []
 dto = ["dep:prost", "dep:prost-types"]
 
 [dependencies]
-prost = { version = "0.13", optional = true }
-prost-types = { version = "0.13", optional = true }
+prost = { version = "0.14", optional = true }
+prost-types = { version = "0.14", optional = true }
 thiserror = "2"
 
 [dev-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
 
 [lints.rust]
 missing_docs = "warn"
