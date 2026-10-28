@@ -45,9 +45,11 @@ mod tests {
             std::env::temp_dir().join(format!("expfmt-proto-test-{}", std::process::id()));
         fs::create_dir_all(&out_dir).expect("temp out_dir should be created");
 
+        let file_descriptors = protox::compile([&proto_file], [&proto_include])
+            .expect("protox should compile metrics.proto");
         prost_build::Config::new()
             .out_dir(&out_dir)
-            .compile_protos(&[&proto_file], &[&proto_include])
+            .compile_fds(file_descriptors)
             .expect("prost-build should compile metrics.proto");
 
         let generated_path = out_dir.join("io.prometheus.client.rs");
