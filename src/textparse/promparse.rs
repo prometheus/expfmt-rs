@@ -16,6 +16,7 @@
 //! and its lexer [`promlex.l`](https://github.com/prometheus/prometheus/blob/main/model/textparse/promlex.l).
 
 use std::borrow::Cow;
+use std::fmt::{self, Write};
 
 use super::{Entry, LabelsBuffer, METRIC_NAME_LABEL, MetricType, ParseError, Parser};
 
@@ -192,7 +193,9 @@ impl<'a> Lexer<'a> {
                     }
                     _ if is_name_start(byte) => {
                         let next = self.next();
-                        self.eat_while(next, |b| is_name_start(b) || b.is_ascii_digit());
+                        self.eat_while(next, |next_byte| {
+                            is_name_start(next_byte) || next_byte.is_ascii_digit()
+                        });
                         self.state = State::Value;
                         Token::MName
                     }
@@ -228,7 +231,9 @@ impl<'a> Lexer<'a> {
                     b' ' | b'\t' => self.whitespace(),
                     _ if is_name_start(byte) => {
                         let next = self.next();
-                        self.eat_while(next, |b| is_name_start(b) || b.is_ascii_digit());
+                        self.eat_while(next, |next_byte| {
+                            is_name_start(next_byte) || next_byte.is_ascii_digit()
+                        });
                         self.state = State::Meta2;
                         Token::MName
                     }
@@ -243,7 +248,7 @@ impl<'a> Lexer<'a> {
                             return Token::Whitespace;
                         }
                     }
-                    self.eat_while(byte, |b| b != 0 && b != b'\n');
+                    self.eat_while(byte, |next_byte| next_byte != 0 && next_byte != b'\n');
                     self.state = State::Init;
                     Token::Text
                 }
@@ -271,7 +276,9 @@ impl<'a> Lexer<'a> {
                     b' ' | b'\t' => self.whitespace(),
                     _ if is_label_start(byte) => {
                         let next = self.next();
-                        self.eat_while(next, |b| is_label_start(b) || b.is_ascii_digit());
+                        self.eat_while(next, |next_byte| {
+                            is_label_start(next_byte) || next_byte.is_ascii_digit()
+                        });
                         Token::LName
                     }
                     _ => Token::Invalid,
@@ -297,7 +304,9 @@ impl<'a> Lexer<'a> {
                     0 | b'\n' => Token::Invalid,
                     _ => {
                         let next = self.next();
-                        self.eat_while(next, |b| !matches!(b, 0 | b'\n' | b' ' | b'\t' | b'{'));
+                        self.eat_while(next, |next_byte| {
+                            !matches!(next_byte, 0 | b'\n' | b' ' | b'\t' | b'{')
+                        });
                         self.state = State::Timestamp;
                         Token::Value
                     }
@@ -311,7 +320,7 @@ impl<'a> Lexer<'a> {
                     b' ' | b'\t' => self.whitespace(),
                     b'0'..=b'9' => {
                         let next = self.next();
-                        self.eat_while(next, |b| b.is_ascii_digit());
+                        self.eat_while(next, |next_byte| next_byte.is_ascii_digit());
                         Token::Timestamp
                     }
                     _ => Token::Invalid,
@@ -426,6 +435,9 @@ impl<'a> PromParser<'a> {
                 Token::QString => true,
                 _ => return Err(self.unexpected("expected label name")),
             };
+            if quoted && std::str::from_utf8(self.lexer.buf()).is_err() {
+                return Err(ParseError::InvalidUtf8 { offset: name_start });
+            }
             token = self.next_token();
             if quoted && matches!(token, Token::Comma | Token::BraceClose) {
                 if self.name.is_some() {
@@ -470,7 +482,7 @@ impl<'a> PromParser<'a> {
             return Err(self.unexpected("expected value after metric"));
         }
         let raw = self.lexer.buf();
-        let val = parse_go_float(raw)
+        let val = parse_sample_value(raw)
             .ok_or_else(|| ParseError::InvalidValue(String::from_utf8_lossy(raw).into_owned()))?;
         self.val = if val.is_nan() {
             f64::from_bits(NORMAL_NAN)
@@ -556,20 +568,12 @@ impl<'a> Parser<'a> for PromParser<'a> {
         (self.metric_name(), self.mtype)
     }
 
-    fn unit(&self) -> (&'a [u8], &'a [u8]) {
-        (b"", b"")
-    }
-
     fn comment(&self) -> &'a [u8] {
         self.text
     }
 
     fn series(&self) -> (&'a [u8], Option<i64>, f64) {
         (self.series, self.ts, self.val)
-    }
-
-    fn start_timestamp(&self) -> Option<i64> {
-        None
     }
 
     fn labels(&self, buf: &mut LabelsBuffer<'a>) -> Result<(), ParseError> {
@@ -592,7 +596,12 @@ impl<'a> Parser<'a> for PromParser<'a> {
                 .then(|| parse_go_float(value.as_bytes()))
                 .flatten()
             {
-                value = Cow::Owned(format_openmetrics_float(parsed));
+                let mut formatted = FloatBuf::default();
+                if format_openmetrics_float(parsed, &mut formatted).is_ok()
+                    && formatted.as_str() != value
+                {
+                    value = Cow::Owned(formatted.as_str().to_owned());
+                }
             }
             buf.push(name, value);
         }
@@ -631,12 +640,22 @@ fn unescape(raw: &[u8], quote: bool) -> Cow<'_, [u8]> {
     Cow::Owned(out)
 }
 
-/// Go's `strconv.ParseFloat(s, 64)` behind promparse's `pP_` guard.
-fn parse_go_float(raw: &[u8]) -> Option<f64> {
-    if raw.iter().any(|b| matches!(b, b'p' | b'P' | b'_')) {
+/// Go's `parseFloat` in promparse.go, which rejects `pP_` before `strconv.ParseFloat`.
+fn parse_sample_value(raw: &[u8]) -> Option<f64> {
+    if raw.iter().any(|byte| matches!(byte, b'p' | b'P' | b'_')) {
         return None;
     }
+    parse_go_float(raw)
+}
+
+/// Go's `strconv.ParseFloat(s, 64)`, without hex float support.
+fn parse_go_float(raw: &[u8]) -> Option<f64> {
     let text = std::str::from_utf8(raw).ok()?;
+    if text.contains('_') {
+        return underscores_ok(raw)
+            .then(|| parse_go_float(text.replace('_', "").as_bytes()))
+            .flatten();
+    }
     let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
     let special = unsigned.starts_with(|c: char| c.is_ascii_alphabetic());
     let val: f64 = text.parse().ok()?;
@@ -646,29 +665,93 @@ fn parse_go_float(raw: &[u8]) -> Option<f64> {
     (!signed_nan && !overflow).then_some(val)
 }
 
+/// Go accepts `_` only between digits, like `1_000`.
+fn underscores_ok(raw: &[u8]) -> bool {
+    raw.iter().enumerate().all(|(index, &byte)| {
+        byte != b'_'
+            || (index > 0
+                && raw[index - 1].is_ascii_digit()
+                && raw.get(index + 1).is_some_and(u8::is_ascii_digit))
+    })
+}
+
+/// Fixed-size buffer so float formatting in `labels()` does not allocate.
+#[derive(Default)]
+struct FloatBuf {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl FloatBuf {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or_default()
+    }
+}
+
+impl fmt::Write for FloatBuf {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        let end = self.len + text.len();
+        self.bytes
+            .get_mut(self.len..end)
+            .ok_or(fmt::Error)?
+            .copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
 /// Go's `labels.FormatOpenMetricsFloat`: `strconv.FormatFloat(v, 'g', -1, 64)` plus `.0`.
-fn format_openmetrics_float(val: f64) -> String {
+fn format_openmetrics_float(val: f64, out: &mut FloatBuf) -> fmt::Result {
     match val {
-        0.0 => return "0.0".to_owned(),
-        _ if val.is_nan() => return "NaN".to_owned(),
-        f64::INFINITY => return "+Inf".to_owned(),
-        f64::NEG_INFINITY => return "-Inf".to_owned(),
+        0.0 => return out.write_str("0.0"),
+        _ if val.is_nan() => return out.write_str("NaN"),
+        f64::INFINITY => return out.write_str("+Inf"),
+        f64::NEG_INFINITY => return out.write_str("-Inf"),
         _ => {}
     }
-    let scientific = format!("{val:e}");
-    let (mantissa, exp) = scientific.split_once('e').unwrap_or((&scientific, "0"));
-    let exp: i32 = exp.parse().unwrap_or_default();
-    // Shortest 'g' switches to exponent form when exp < -4 || exp >= 6.
-    let mut out = if (-4..6).contains(&exp) {
-        format!("{val}")
-    } else {
-        let sign = if exp < 0 { '-' } else { '+' };
-        format!("{mantissa}e{sign}{:02}", exp.abs())
+    let mut scientific = FloatBuf::default();
+    write!(scientific, "{val:e}")?;
+    // Go picks the correctly rounded digits among the shortest forms, Rust may not,
+    // so keep Rust's shortest digit count and round again to it.
+    let mantissa_digits = scientific.as_str().split('e').next().unwrap_or_default();
+    let precision = mantissa_digits.bytes().filter(u8::is_ascii_digit).count() - 1;
+    scientific = FloatBuf::default();
+    write!(scientific, "{val:.precision$e}")?;
+    let (mantissa, exp) = scientific.as_str().split_once('e').ok_or(fmt::Error)?;
+    let exp: i32 = exp.parse().map_err(|_| fmt::Error)?;
+    let (sign, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", mantissa),
     };
-    if !out.contains(['e', '.']) {
-        out.push_str(".0");
+    out.write_str(sign)?;
+    // Shortest 'g' switches to exponent form when exp < -4 || exp >= 6.
+    if !(-4..6).contains(&exp) {
+        let exp_sign = if exp < 0 { '-' } else { '+' };
+        return write!(out, "{mantissa}e{exp_sign}{:02}", exp.abs());
     }
-    out
+    let mut digits = mantissa.bytes().filter(|byte| *byte != b'.');
+    if exp < 0 {
+        out.write_str("0.")?;
+        for _ in exp + 1..0 {
+            out.write_str("0")?;
+        }
+        return digits.try_for_each(|digit| out.write_char(char::from(digit)));
+    }
+    let integer_len = exp as usize + 1;
+    let digit_count = mantissa.len() - usize::from(mantissa.contains('.'));
+    for (index, digit) in digits.enumerate() {
+        if index == integer_len {
+            out.write_str(".")?;
+        }
+        out.write_char(char::from(digit))?;
+    }
+    for _ in digit_count..integer_len {
+        out.write_str("0")?;
+    }
+    if digit_count <= integer_len {
+        out.write_str(".0")?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -863,6 +946,7 @@ mod tests {
             b"a\0{b=\"ddd\"} 1",
             b"a 0 1\0",
         ];
+        assert!(PromParser::new(b"{\"\xff\"} 1\n").next_entry().is_err());
         for input in inputs {
             assert!(
                 parse(input).is_err(),
@@ -874,6 +958,7 @@ mod tests {
 
     #[test]
     fn parse_go_float_matches_go() {
+        assert_eq!(parse_sample_value(b"1_000"), None);
         let ok = [
             ("1", 1.0),
             ("+.5", 0.5),
@@ -884,13 +969,15 @@ mod tests {
             ("+Infinity", f64::INFINITY),
             ("1e-400", 0.0),
             ("00012", 12.0),
+            ("1_000", 1000.0),
+            ("1e1_0", 1e10),
         ];
         for (text, want) in ok {
             assert_eq!(parse_go_float(text.as_bytes()), Some(want), "{text}");
         }
         assert!(parse_go_float(b"nan").unwrap().is_nan());
         for text in [
-            ".", "1e", "infin", "+NaN", "-nan", "1e400", "0x10", "+", "e5",
+            ".", "1e", "infin", "+NaN", "-nan", "1e400", "0x10", "+", "e5", "1__0", "_1", "1_",
         ] {
             assert_eq!(parse_go_float(text.as_bytes()), None, "{text}");
         }
@@ -909,10 +996,16 @@ mod tests {
             (1e-5, "1e-05"),
             (1e21, "1e+21"),
             (5e-324, "5e-324"),
+            (-0.00012, "-0.00012"),
+            (12.5, "12.5"),
+            (1453167548838524.2, "1.4531675488385242e+15"),
+            (1234.5678901234567, "1234.5678901234567"),
             (f64::NEG_INFINITY, "-Inf"),
         ];
         for (val, want) in cases {
-            assert_eq!(format_openmetrics_float(val), want);
+            let mut out = FloatBuf::default();
+            format_openmetrics_float(val, &mut out).unwrap();
+            assert_eq!(out.as_str(), want);
         }
     }
 }

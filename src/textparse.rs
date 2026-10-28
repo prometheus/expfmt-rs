@@ -25,19 +25,16 @@ pub const METRIC_NAME_LABEL: &str = "__name__";
 
 /// Kind of the entry the parser is positioned on after [`Parser::next_entry`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Entry {
     /// A `# TYPE` line. Read it with [`Parser::metric_type`].
     Type,
     /// A `# HELP` line. Read it with [`Parser::help`].
     Help,
-    /// A `# UNIT` line. Read it with [`Parser::unit`].
-    Unit,
     /// Any other comment line. Read it with [`Parser::comment`].
     Comment,
     /// A sample with a float64 value. Read it with [`Parser::series`] and [`Parser::labels`].
     Series,
-    /// A sample with a native histogram value.
-    Histogram,
 }
 
 /// Metric type declared by a `# TYPE` line.
@@ -162,17 +159,11 @@ pub trait Parser<'a> {
     /// Returns the metric name and type of the current [`Entry::Type`].
     fn metric_type(&self) -> (&'a [u8], MetricType);
 
-    /// Returns the metric name and unit of the current [`Entry::Unit`].
-    fn unit(&self) -> (&'a [u8], &'a [u8]);
-
     /// Returns the text of the current [`Entry::Comment`], including the leading `#`.
     fn comment(&self) -> &'a [u8];
 
     /// Returns the raw series bytes, optional sample timestamp in ms, and float64 value.
     fn series(&self) -> (&'a [u8], Option<i64>, f64);
-
-    /// Returns the start timestamp in ms if present via `st@...` or `_created`.
-    fn start_timestamp(&self) -> Option<i64>;
 
     /// Clears `buf` and fills it with the current sample's labels, sorted by name, matching Go:
     /// the metric name is stored under [`METRIC_NAME_LABEL`], and `le` on histograms and

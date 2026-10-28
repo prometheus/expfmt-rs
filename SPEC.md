@@ -79,7 +79,7 @@ pub trait Parser<'a> {
     /// Advances to the next entry in the exposition stream, returning `Ok(None)` at EOF.
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError>;
 
-    fn help(&self) -> (&'a [u8], &'a [u8]);
+    fn help(&self) -> (&'a [u8], Cow<'a, [u8]>);
     fn metric_type(&self) -> (&'a [u8], MetricType);
     fn unit(&self) -> (&'a [u8], &'a [u8]);
     fn comment(&self) -> &'a [u8];
