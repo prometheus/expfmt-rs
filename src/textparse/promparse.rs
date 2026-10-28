@@ -176,154 +176,145 @@ impl<'a> Lexer<'a> {
         Token::Whitespace
     }
 
+    /// Consumes one byte, then moves to `state` and returns `token`.
+    fn emit(&mut self, state: State, token: Token) -> Token {
+        self.next();
+        self.state = state;
+        token
+    }
+
+    /// Consumes a quoted string, then moves to `state` and returns `token`.
+    fn emit_quoted(&mut self, state: State, token: Token) -> Token {
+        if !self.quoted() {
+            return Token::Invalid;
+        }
+        self.state = state;
+        token
+    }
+
     fn lex(&mut self) -> Token {
         if self.i >= self.len() {
             return Token::Eof;
         }
-        let mut byte = self.cur();
         self.start = self.i;
-        loop {
-            if is_ws(byte) && self.state != State::Meta2 {
-                return self.whitespace();
-            }
-            return match self.state {
-                State::Init => match byte {
-                    0 => Token::Eof,
-                    b'\n' => {
-                        self.next();
-                        Token::Linebreak
-                    }
-                    b'#' => {
-                        let next = self.next();
-                        if !is_ws(next) {
-                            return self.consume_comment();
-                        }
-                        byte = self.eat_after(is_ws);
-                        self.state = State::Comment;
-                        continue;
-                    }
-                    b'{' => {
-                        self.next();
-                        self.state = State::Labels;
-                        Token::BraceOpen
-                    }
-                    _ if is_name_start(byte) => {
-                        self.eat_after(is_name_char);
-                        self.state = State::Value;
-                        Token::MName
-                    }
-                    _ => Token::Invalid,
-                },
-                State::Comment => match byte {
-                    b'H' | b'T' => {
-                        let (rest, token) = if byte == b'H' {
-                            (b"ELP", Token::Help)
-                        } else {
-                            (b"YPE", Token::Type)
-                        };
-                        if rest.iter().all(|&expected| self.next() == expected)
-                            && is_ws(self.next())
-                        {
-                            self.whitespace();
-                            self.state = State::Meta1;
-                            return token;
-                        }
-                        self.consume_comment()
-                    }
-                    _ => self.consume_comment(),
-                },
-                State::Meta1 => match byte {
-                    b'"' => {
-                        if !self.quoted() {
-                            return Token::Invalid;
-                        }
-                        self.state = State::Meta2;
-                        Token::MName
-                    }
-                    _ if is_name_start(byte) => {
-                        self.eat_after(is_name_char);
-                        self.state = State::Meta2;
-                        Token::MName
-                    }
-                    _ => Token::Invalid,
-                },
-                State::Meta2 => {
-                    // `[ \t]+` wins over `[^\n]*` on a tie, so trailing blanks are whitespace.
-                    if is_ws(byte) {
-                        byte = self.eat_after(is_ws);
-                        if byte == 0 || byte == b'\n' {
-                            return Token::Whitespace;
-                        }
-                    }
-                    self.eat_while(byte, |next_byte| next_byte != 0 && next_byte != b'\n');
-                    self.state = State::Init;
-                    Token::Text
+        let byte = self.cur();
+        if is_ws(byte) && self.state != State::Meta2 {
+            return self.whitespace();
+        }
+        match self.state {
+            State::Init => self.lex_init(byte),
+            State::Comment => self.lex_comment(byte),
+            State::Meta1 => self.lex_meta1(byte),
+            State::Meta2 => self.lex_meta2(byte),
+            State::Labels => self.lex_labels(byte),
+            State::LValue => self.lex_lvalue(byte),
+            State::Value => self.lex_value(byte),
+            State::Timestamp => self.lex_timestamp(byte),
+        }
+    }
+
+    fn lex_init(&mut self, byte: u8) -> Token {
+        match byte {
+            0 => Token::Eof,
+            b'\n' => self.emit(State::Init, Token::Linebreak),
+            b'#' => {
+                if !is_ws(self.next()) {
+                    return self.consume_comment();
                 }
-                State::Labels => match byte {
-                    b'"' => {
-                        if !self.quoted() {
-                            return Token::Invalid;
-                        }
-                        Token::QString
-                    }
-                    b',' => {
-                        self.next();
-                        Token::Comma
-                    }
-                    b'=' => {
-                        self.next();
-                        self.state = State::LValue;
-                        Token::Equal
-                    }
-                    b'}' => {
-                        self.next();
-                        self.state = State::Value;
-                        Token::BraceClose
-                    }
-                    _ if is_label_start(byte) => {
-                        self.eat_after(is_label_char);
-                        Token::LName
-                    }
-                    _ => Token::Invalid,
-                },
-                State::LValue => match byte {
-                    b'"' => {
-                        if !self.quoted() {
-                            return Token::Invalid;
-                        }
-                        self.state = State::Labels;
-                        Token::LValue
-                    }
-                    _ => Token::Invalid,
-                },
-                State::Value => match byte {
-                    b'{' => {
-                        self.next();
-                        self.state = State::Labels;
-                        Token::BraceOpen
-                    }
-                    0 | b'\n' => Token::Invalid,
-                    _ => {
-                        self.eat_after(|next_byte| {
-                            !matches!(next_byte, 0 | b'\n' | b' ' | b'\t' | b'{')
-                        });
-                        self.state = State::Timestamp;
-                        Token::Value
-                    }
-                },
-                State::Timestamp => match byte {
-                    b'\n' => {
-                        self.next();
-                        self.state = State::Init;
-                        Token::Linebreak
-                    }
-                    b'0'..=b'9' => {
-                        self.eat_after(|next_byte| next_byte.is_ascii_digit());
-                        Token::Timestamp
-                    }
-                    _ => Token::Invalid,
-                },
-            };
+                let byte = self.eat_after(is_ws);
+                self.state = State::Comment;
+                self.lex_comment(byte)
+            }
+            b'{' => self.emit(State::Labels, Token::BraceOpen),
+            _ if is_name_start(byte) => {
+                self.eat_after(is_name_char);
+                self.state = State::Value;
+                Token::MName
+            }
+            _ => Token::Invalid,
+        }
+    }
+
+    fn lex_comment(&mut self, byte: u8) -> Token {
+        let (rest, token) = match byte {
+            b'H' => (b"ELP", Token::Help),
+            b'T' => (b"YPE", Token::Type),
+            _ => return self.consume_comment(),
+        };
+        if rest.iter().all(|&expected| self.next() == expected) && is_ws(self.next()) {
+            self.whitespace();
+            self.state = State::Meta1;
+            return token;
+        }
+        self.consume_comment()
+    }
+
+    fn lex_meta1(&mut self, byte: u8) -> Token {
+        match byte {
+            b'"' => self.emit_quoted(State::Meta2, Token::MName),
+            _ if is_name_start(byte) => {
+                self.eat_after(is_name_char);
+                self.state = State::Meta2;
+                Token::MName
+            }
+            _ => Token::Invalid,
+        }
+    }
+
+    fn lex_meta2(&mut self, mut byte: u8) -> Token {
+        // `[ \t]+` wins over `[^\n]*` on a tie, so trailing blanks are whitespace.
+        if is_ws(byte) {
+            byte = self.eat_after(is_ws);
+            if byte == 0 || byte == b'\n' {
+                return Token::Whitespace;
+            }
+        }
+        self.eat_while(byte, |next_byte| next_byte != 0 && next_byte != b'\n');
+        self.state = State::Init;
+        Token::Text
+    }
+
+    fn lex_labels(&mut self, byte: u8) -> Token {
+        match byte {
+            b'"' => self.emit_quoted(State::Labels, Token::QString),
+            b',' => self.emit(State::Labels, Token::Comma),
+            b'=' => self.emit(State::LValue, Token::Equal),
+            b'}' => self.emit(State::Value, Token::BraceClose),
+            _ if is_label_start(byte) => {
+                self.eat_after(is_label_char);
+                Token::LName
+            }
+            _ => Token::Invalid,
+        }
+    }
+
+    fn lex_lvalue(&mut self, byte: u8) -> Token {
+        match byte {
+            b'"' => self.emit_quoted(State::Labels, Token::LValue),
+            _ => Token::Invalid,
+        }
+    }
+
+    fn lex_value(&mut self, byte: u8) -> Token {
+        match byte {
+            b'{' => self.emit(State::Labels, Token::BraceOpen),
+            0 | b'\n' => Token::Invalid,
+            _ => {
+                self.eat_after(|next_byte| !matches!(next_byte, 0 | b'\n' | b' ' | b'\t' | b'{'));
+                self.state = State::Timestamp;
+                Token::Value
+            }
+        }
+    }
+
+    fn lex_timestamp(&mut self, byte: u8) -> Token {
+        match byte {
+            b'\n' => self.emit(State::Init, Token::Linebreak),
+            b'0'..=b'9' => {
+                self.eat_after(|next_byte| next_byte.is_ascii_digit());
+                Token::Timestamp
+            }
+            _ => Token::Invalid,
         }
     }
 }
