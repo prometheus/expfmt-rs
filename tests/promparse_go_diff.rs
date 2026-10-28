@@ -13,8 +13,8 @@
 
 //! Compares `PromParser` output with Go's `textparse.PromParser` output stored in `testdata/promparse`.
 
-use std::fmt::Write;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
 use expfmt::textparse::{Entry, LabelsBuffer, MetricType, Parser, PromParser};
@@ -35,20 +35,17 @@ const FIXTURES: &[(&str, &str)] = &[
     ("expfmt/text", "promparse/expfmt_text.txt"),
 ];
 
-fn quote(bytes: &[u8]) -> String {
-    let mut out = String::from("\"");
-    let mut raw = Vec::new();
+fn quote(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.push(b'"');
     for &byte in bytes {
         match byte {
-            b'\\' => raw.extend_from_slice(b"\\\\"),
-            b'"' => raw.extend_from_slice(b"\\\""),
-            0..0x20 | 0x7f => raw.extend_from_slice(format!("\\x{byte:02x}").as_bytes()),
-            _ => raw.push(byte),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'"' => out.extend_from_slice(b"\\\""),
+            0..0x20 | 0x7f => out.extend_from_slice(format!("\\x{byte:02x}").as_bytes()),
+            _ => out.push(byte),
         }
     }
-    out.push_str(&String::from_utf8_lossy(&raw));
-    out.push('"');
-    out
+    out.push(b'"');
 }
 
 /// Go's `strconv.FormatFloat(v, 'e', -1, 64)`, with Prometheus spellings for NaN and infinities.
@@ -59,7 +56,12 @@ fn format_value(val: f64) -> String {
     if val.is_infinite() {
         return if val > 0.0 { "+Inf" } else { "-Inf" }.to_owned();
     }
-    let scientific = format!("{val:e}");
+    let mut scientific = format!("{val:e}");
+    // Go picks the correctly rounded digits among the shortest forms, Rust may not,
+    // so keep Rust's shortest digit count and round again to it.
+    let mantissa = scientific.split('e').next().unwrap();
+    let precision = mantissa.bytes().filter(u8::is_ascii_digit).count() - 1;
+    scientific = format!("{val:.precision$e}");
     let (mantissa, exp) = scientific.split_once('e').unwrap();
     let exp: i32 = exp.parse().unwrap();
     let sign = if exp < 0 { '-' } else { '+' };
@@ -76,50 +78,57 @@ fn type_name(mtype: MetricType) -> &'static str {
     }
 }
 
-fn render(input: &[u8]) -> String {
+fn render(input: &[u8]) -> Vec<u8> {
     let mut parser = PromParser::new(input);
     let mut buf = LabelsBuffer::new();
-    let mut out = String::new();
+    let mut out = Vec::new();
     loop {
         let entry = match parser.next_entry() {
             Ok(Some(entry)) => entry,
             Ok(None) => return out,
             Err(_) => {
-                out.push_str("error\n");
+                out.extend_from_slice(b"error\n");
                 return out;
             }
         };
         match entry {
             Entry::Help => {
                 let (name, text) = parser.help();
-                writeln!(out, "help {} {}", quote(name), quote(&text)).unwrap();
+                out.extend_from_slice(b"help ");
+                quote(&mut out, name);
+                out.push(b' ');
+                quote(&mut out, &text);
             }
             Entry::Type => {
                 let (name, mtype) = parser.metric_type();
-                writeln!(out, "type {} {}", quote(name), type_name(mtype)).unwrap();
+                out.extend_from_slice(b"type ");
+                quote(&mut out, name);
+                write!(out, " {}", type_name(mtype)).unwrap();
             }
-            Entry::Comment => writeln!(out, "comment {}", quote(parser.comment())).unwrap(),
+            Entry::Comment => {
+                out.extend_from_slice(b"comment ");
+                quote(&mut out, parser.comment());
+            }
             Entry::Series => {
                 let (series, ts, val) = parser.series();
+                out.extend_from_slice(b"series ");
+                quote(&mut out, series);
                 let ts = ts.map_or("-".to_owned(), |ts| ts.to_string());
-                write!(out, "series {} {} {ts}", quote(series), format_value(val)).unwrap();
+                write!(out, " {} {ts}", format_value(val)).unwrap();
                 if parser.labels(&mut buf).is_err() {
-                    out.push_str("\nerror\n");
+                    out.extend_from_slice(b"\nerror\n");
                     return out;
                 }
                 for (name, value) in buf.iter() {
-                    write!(
-                        out,
-                        " {}={}",
-                        quote(name.as_bytes()),
-                        quote(value.as_bytes())
-                    )
-                    .unwrap();
+                    out.push(b' ');
+                    quote(&mut out, name.as_bytes());
+                    out.push(b'=');
+                    quote(&mut out, value.as_bytes());
                 }
-                out.push('\n');
             }
             other => panic!("unexpected entry {other:?}"),
         }
+        out.push(b'\n');
     }
 }
 
@@ -128,9 +137,32 @@ fn matches_go_promparse_output() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata");
     for (input, expected) in FIXTURES {
         let input_bytes = fs::read(root.join(input)).unwrap();
-        let want = fs::read_to_string(root.join(expected)).unwrap();
-        assert_eq!(render(&input_bytes), want, "fixture {input}");
+        let want = fs::read(root.join(expected)).unwrap();
+        let got = render(&input_bytes);
+        // Compare as text first for a readable diff, then as bytes for non-UTF-8 input.
+        assert_eq!(
+            String::from_utf8_lossy(&got),
+            String::from_utf8_lossy(&want),
+            "fixture {input}"
+        );
+        assert_eq!(got, want, "fixture {input}");
     }
+}
+
+#[test]
+fn every_go_expected_file_is_checked() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/promparse");
+    let mut on_disk: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| format!("promparse/{}", entry.unwrap().file_name().to_string_lossy()))
+        .collect();
+    on_disk.sort();
+    let mut checked: Vec<String> = FIXTURES
+        .iter()
+        .map(|(_, expected)| expected.to_string())
+        .collect();
+    checked.sort();
+    assert_eq!(on_disk, checked);
 }
 
 #[test]
@@ -141,6 +173,7 @@ fn format_value_matches_go() {
         (2.279966416e9, "2.279966416e+09"),
         (123456.0, "1.23456e+05"),
         (1e-300, "1e-300"),
+        (1453167548838524.2, "1.4531675488385242e+15"),
         (f64::NEG_INFINITY, "-Inf"),
     ];
     for (val, want) in cases {

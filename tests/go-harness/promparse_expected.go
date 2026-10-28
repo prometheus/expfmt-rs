@@ -91,8 +91,8 @@ func renderPromParse(data []byte) string {
 			}
 			fmt.Fprintf(&out, "series %s %s %s", quote(series), formatValue(value), timestamp)
 			parser.Labels(&lset)
-			lset.Range(func(l labels.Label) {
-				fmt.Fprintf(&out, " %s=%s", quote([]byte(l.Name)), quote([]byte(l.Value)))
+			lset.Range(func(label labels.Label) {
+				fmt.Fprintf(&out, " %s=%s", quote([]byte(label.Name)), quote([]byte(label.Value)))
 			})
 			out.WriteString("\n")
 		}
@@ -101,32 +101,32 @@ func renderPromParse(data []byte) string {
 
 // quote escapes bytes instead of runes so Rust can reproduce it without Go's
 // strconv.Quote rules for non-printable Unicode.
-func quote(b []byte) string {
+func quote(raw []byte) string {
 	var out strings.Builder
 	out.WriteByte('"')
-	for _, c := range b {
+	for _, rawByte := range raw {
 		switch {
-		case c == '\\' || c == '"':
+		case rawByte == '\\' || rawByte == '"':
 			out.WriteByte('\\')
-			out.WriteByte(c)
-		case c < 0x20 || c == 0x7f:
-			fmt.Fprintf(&out, `\x%02x`, c)
+			out.WriteByte(rawByte)
+		case rawByte < 0x20 || rawByte == 0x7f:
+			fmt.Fprintf(&out, `\x%02x`, rawByte)
 		default:
-			out.WriteByte(c)
+			out.WriteByte(rawByte)
 		}
 	}
 	out.WriteByte('"')
 	return out.String()
 }
 
-func formatValue(v float64) string {
+func formatValue(value float64) string {
 	switch {
-	case math.IsNaN(v):
+	case math.IsNaN(value):
 		return "NaN"
-	case math.IsInf(v, 1):
+	case math.IsInf(value, 1):
 		return "+Inf"
-	case math.IsInf(v, -1):
+	case math.IsInf(value, -1):
 		return "-Inf"
 	}
-	return strconv.FormatFloat(v, 'e', -1, 64)
+	return strconv.FormatFloat(value, 'e', -1, 64)
 }
