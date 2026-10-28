@@ -219,11 +219,11 @@ func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 		}
 		var extracted string
 		var found bool
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
 			if found {
 				return false
 			}
-			assign, ok := n.(*ast.AssignStmt)
+			assign, ok := node.(*ast.AssignStmt)
 			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
 				return true
 			}
@@ -248,25 +248,25 @@ func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 }
 
 func evalStringExpr(expr ast.Expr) (string, bool) {
-	switch e := expr.(type) {
+	switch typedExpr := expr.(type) {
 	case *ast.BasicLit:
-		if e.Kind != token.STRING {
+		if typedExpr.Kind != token.STRING {
 			return "", false
 		}
-		s, err := strconv.Unquote(e.Value)
+		unquoted, err := strconv.Unquote(typedExpr.Value)
 		if err != nil {
 			return "", false
 		}
-		return s, true
+		return unquoted, true
 	case *ast.BinaryExpr:
-		if e.Op != token.ADD {
+		if typedExpr.Op != token.ADD {
 			return "", false
 		}
-		left, ok := evalStringExpr(e.X)
+		left, ok := evalStringExpr(typedExpr.X)
 		if !ok {
 			return "", false
 		}
-		right, ok := evalStringExpr(e.Y)
+		right, ok := evalStringExpr(typedExpr.Y)
 		if !ok {
 			return "", false
 		}

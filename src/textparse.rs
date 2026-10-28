@@ -141,17 +141,22 @@ impl<'a> LabelsBuffer<'a> {
 
     /// Sorts the labels by name.
     pub fn sort(&mut self) {
-        self.labels.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        self.labels
+            .sort_unstable_by(|left, right| left.0.cmp(&right.0));
     }
 
     /// Returns the value of the label `name`, if present.
     pub fn get(&self, name: &str) -> Option<&str> {
-        self.iter().find(|(n, _)| *n == name).map(|(_, v)| v)
+        self.iter()
+            .find(|(label_name, _)| *label_name == name)
+            .map(|(_, value)| value)
     }
 
     /// Iterates over `(name, value)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.labels.iter().map(|(n, v)| (n.as_ref(), v.as_ref()))
+        self.labels
+            .iter()
+            .map(|(name, value)| (name.as_ref(), value.as_ref()))
     }
 
     /// Returns the number of labels.

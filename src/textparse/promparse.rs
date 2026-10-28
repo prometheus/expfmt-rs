@@ -643,7 +643,10 @@ fn unescape_label(raw: &str) -> Cow<'_, str> {
     match unescape(raw.as_bytes(), true) {
         Cow::Borrowed(_) => Cow::Borrowed(raw),
         // Replacing ASCII escapes keeps valid UTF-8 valid, so nothing is lost here.
-        Cow::Owned(bytes) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+        Cow::Owned(bytes) => Cow::Owned(
+            String::from_utf8(bytes)
+                .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned()),
+        ),
     }
 }
 
