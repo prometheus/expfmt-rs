@@ -16,6 +16,7 @@
 
 use std::borrow::Cow;
 
+mod float;
 #[cfg(test)]
 mod go_diff_tests;
 mod promparse;
