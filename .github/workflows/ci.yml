@@ -48,6 +48,9 @@ jobs:
         with:
           go-version-file: tests/go-harness/go.mod
           cache-dependency-path: tests/go-harness/go.sum
+      - name: Test fixture extractor
+        working-directory: tests/go-harness
+        run: go test ./...
       - name: Verify testdata is in sync with tests/go-harness/go.mod
         run: |
           cd tests/go-harness

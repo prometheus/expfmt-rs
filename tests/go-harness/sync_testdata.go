@@ -204,8 +204,9 @@ func copyDirFiles(srcDir, dstDir, outRoot string) ([]string, error) {
 }
 
 // extractFuncInputLiteral parses srcFile with go/parser and extracts the string literal
-// assigned to `input := ...` inside funcName, followed by every `input += ...` literal
-// that comes after it in the same function, in source order.
+// assigned to `input := ...` at the top level of funcName, followed by every top-level
+// `input += ...` literal, in source order. Assignments inside nested blocks are ignored
+// because they belong to subtests or conditional paths, not to the shared input.
 func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 	fset := token.NewFileSet()
 	fileNode, err := parser.ParseFile(fset, srcFile, nil, 0)
@@ -220,37 +221,28 @@ func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 		}
 		var extracted string
 		var found bool
-		var appendErr error
-		ast.Inspect(fn.Body, func(node ast.Node) bool {
-			if appendErr != nil {
-				return false
-			}
-			assign, ok := node.(*ast.AssignStmt)
+		for _, stmt := range fn.Body.List {
+			assign, ok := stmt.(*ast.AssignStmt)
 			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
-				return true
+				continue
 			}
 			ident, ok := assign.Lhs[0].(*ast.Ident)
 			if !ok || ident.Name != "input" {
-				return true
+				continue
 			}
-			switch {
-			case !found && assign.Tok == token.DEFINE:
-				if val, ok := evalStringExpr(assign.Rhs[0]); ok {
-					extracted = val
-					found = true
-				}
-			case found && assign.Tok == token.ADD_ASSIGN:
-				val, ok := evalStringExpr(assign.Rhs[0])
-				if !ok {
-					appendErr = fmt.Errorf("%s: input += with a non-literal expression in %s", fset.Position(assign.Pos()), funcName)
-					return false
-				}
-				extracted += val
+			pos := fset.Position(assign.Pos())
+			if !found && assign.Tok != token.DEFINE {
+				continue
 			}
-			return true
-		})
-		if appendErr != nil {
-			return "", appendErr
+			if found && assign.Tok != token.ADD_ASSIGN {
+				return "", fmt.Errorf("%s: unsupported input %s in %s", pos, assign.Tok, funcName)
+			}
+			val, ok := evalStringExpr(assign.Rhs[0])
+			if !ok {
+				return "", fmt.Errorf("%s: input %s with a non-literal expression in %s", pos, assign.Tok, funcName)
+			}
+			extracted += val
+			found = true
 		}
 		if found {
 			return extracted, nil
