@@ -204,7 +204,8 @@ func copyDirFiles(srcDir, dstDir, outRoot string) ([]string, error) {
 }
 
 // extractFuncInputLiteral parses srcFile with go/parser and extracts the string literal
-// assigned to `input := ...` inside funcName.
+// assigned to `input := ...` inside funcName, followed by every `input += ...` literal
+// that comes after it in the same function, in source order.
 func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 	fset := token.NewFileSet()
 	fileNode, err := parser.ParseFile(fset, srcFile, nil, 0)
@@ -219,8 +220,9 @@ func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 		}
 		var extracted string
 		var found bool
+		var appendErr error
 		ast.Inspect(fn.Body, func(node ast.Node) bool {
-			if found {
+			if appendErr != nil {
 				return false
 			}
 			assign, ok := node.(*ast.AssignStmt)
@@ -231,14 +233,25 @@ func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 			if !ok || ident.Name != "input" {
 				return true
 			}
-			val, ok := evalStringExpr(assign.Rhs[0])
-			if ok {
-				extracted = val
-				found = true
-				return false
+			switch {
+			case !found && assign.Tok == token.DEFINE:
+				if val, ok := evalStringExpr(assign.Rhs[0]); ok {
+					extracted = val
+					found = true
+				}
+			case found && assign.Tok == token.ADD_ASSIGN:
+				val, ok := evalStringExpr(assign.Rhs[0])
+				if !ok {
+					appendErr = fmt.Errorf("%s: input += with a non-literal expression in %s", fset.Position(assign.Pos()), funcName)
+					return false
+				}
+				extracted += val
 			}
 			return true
 		})
+		if appendErr != nil {
+			return "", appendErr
+		}
 		if found {
 			return extracted, nil
 		}

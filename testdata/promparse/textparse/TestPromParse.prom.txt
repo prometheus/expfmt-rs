@@ -42,3 +42,5 @@ type "type_and_unit_test1" gauge
 series "type_and_unit_test1{__type__=\"counter\"}" 405ec00000000000 - "__name__"="type_and_unit_test1" "__type__"="counter"
 help "type_and_unit_test2" "Type specified in label."
 series "type_and_unit_test2{__type__=\"counter\"}" 405ec00000000000 - "__name__"="type_and_unit_test2" "__type__"="counter"
+help "metric" "foo\x00bar"
+series "null_byte_metric{a=\"abc\x00\"}" 3ff0000000000000 - "__name__"="null_byte_metric" "a"="abc\x00"
