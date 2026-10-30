@@ -589,7 +589,7 @@ fn normalize_float_label<'v>(
         MetricType::Summary => name == QUANTILE_LABEL,
         _ => false,
     };
-    // ponytail: Go's ParseFloat also accepts hex floats here (le="0x1p3"); we leave them as is.
+    // NOTE: Go's ParseFloat also accepts hex floats here (le="0x1p3"); we leave them as is.
     let Some(parsed) = is_float_label.then(|| parse_go_float(&value)).flatten() else {
         return value;
     };
