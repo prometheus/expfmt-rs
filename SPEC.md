@@ -63,7 +63,7 @@ Decoding is split into three chained layers so streaming callers pay zero per-sa
 
 ### Layer 0: Zero-copy streaming parser
 
-Modeled on Prometheus's [`model/textparse.Parser`](https://github.com/prometheus/prometheus/blob/main/model/textparse/interface.go), the low-level parser advances entry-by-entry over a byte slice without allocating per sample:
+Modeled on Prometheus's [`model/textparse.Parser`](https://github.com/prometheus/prometheus/blob/main/model/textparse/interface.go), the low-level parser advances entry-by-entry over a byte slice without allocating per sample. It is internal to the crate; the Arrow and `dto` decoders are the public API:
 
 ```rust
 pub enum Entry {

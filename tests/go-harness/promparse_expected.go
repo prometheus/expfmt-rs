@@ -29,7 +29,7 @@ import (
 
 // promParseInputs are the Prometheus text fixtures, relative to testdata/. Each
 // output is written to testdata/promparse/ under the same relative path, which is
-// how tests/promparse_go_diff.rs finds the input for each expected file.
+// how src/textparse/go_diff_tests.rs finds the input for each expected file.
 var promParseInputs = []string{
 	"textparse/TestPromParse.prom.txt",
 	"textparse/alltypes.237mfs.prom.txt",

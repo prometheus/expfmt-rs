@@ -16,6 +16,8 @@
 
 use std::borrow::Cow;
 
+#[cfg(test)]
+mod go_diff_tests;
 mod promparse;
 
 pub use promparse::PromParser;

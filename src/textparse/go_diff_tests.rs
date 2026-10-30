@@ -17,7 +17,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use expfmt::textparse::{Entry, LabelsBuffer, Parser, PromParser};
+use super::{Entry, LabelsBuffer, Parser, PromParser};
 
 fn quote(out: &mut Vec<u8>, bytes: &[u8]) {
     out.push(b'"');
@@ -77,7 +77,6 @@ fn render(input: &[u8]) -> Vec<u8> {
                     quote(&mut out, value.as_bytes());
                 }
             }
-            other => panic!("unexpected entry {other:?}"),
         }
         out.push(b'\n');
     }
