@@ -926,6 +926,7 @@ mod tests {
         let input = concat!(
             "# HELP \"go.gc\" doc\n",
             "{\"go.gc\",quantile=\"0.25\",} 7\n",
+            "{\"go.gc\"} 8\n",
             "{ \"a\\\"b\\\\c\\nd\", \"strange©\\n\"=\"6\" } 10.0\n",
             "# HELP metric foo\0bar\n",
             "# c\0mment\n",
@@ -940,6 +941,7 @@ mod tests {
                 7.0,
                 &[("__name__", "go.gc"), ("quantile", "0.25")],
             ),
+            series("{\"go.gc\"}", None, 8.0, &[("__name__", "go.gc")]),
             series(
                 "{ \"a\\\"b\\\\c\\nd\", \"strange©\\n\"=\"6\" }",
                 None,
