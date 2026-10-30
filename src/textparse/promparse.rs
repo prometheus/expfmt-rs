@@ -593,6 +593,9 @@ fn normalize_float_label<'v>(
     let Some(parsed) = is_float_label.then(|| parse_go_float(&value)).flatten() else {
         return value;
     };
+    if let Some(common) = common_openmetrics_float(parsed) {
+        return Cow::Borrowed(common);
+    }
     let mut formatted = FloatBuf::default();
     if format_openmetrics_float(parsed, &mut formatted).is_err() || formatted.as_str() == value {
         return value;
@@ -718,14 +721,23 @@ impl fmt::Write for FloatBuf {
     }
 }
 
+/// The values Go's `labels.FormatOpenMetricsFloat` returns as constants.
+fn common_openmetrics_float(value: f64) -> Option<&'static str> {
+    match value {
+        0.0 => Some("0.0"),
+        1.0 => Some("1.0"),
+        -1.0 => Some("-1.0"),
+        f64::INFINITY => Some("+Inf"),
+        f64::NEG_INFINITY => Some("-Inf"),
+        _ if value.is_nan() => Some("NaN"),
+        _ => None,
+    }
+}
+
 /// Go's `labels.FormatOpenMetricsFloat`: `strconv.FormatFloat(v, 'g', -1, 64)` plus `.0`.
 fn format_openmetrics_float(value: f64, out: &mut FloatBuf) -> fmt::Result {
-    match value {
-        0.0 => return out.write_str("0.0"),
-        _ if value.is_nan() => return out.write_str("NaN"),
-        f64::INFINITY => return out.write_str("+Inf"),
-        f64::NEG_INFINITY => return out.write_str("-Inf"),
-        _ => {}
+    if let Some(common) = common_openmetrics_float(value) {
+        return out.write_str(common);
     }
     let scientific = go_shortest_scientific(value)?;
     let (mantissa, exp) = scientific.as_str().split_once('e').ok_or(fmt::Error)?;
@@ -1044,7 +1056,7 @@ mod tests {
 
     #[test]
     fn borrowed_labels_outlive_clear() {
-        let input = b"# TYPE h histogram\nh{le=\"1\"} 1\n";
+        let input = b"# TYPE h histogram\nh{le=\"2\"} 1\n";
         let mut parser = PromParser::new(input);
         let mut buf = LabelsBuffer::new();
         parser.next_entry().unwrap();
@@ -1059,5 +1071,24 @@ mod tests {
         }
         buf.clear();
         assert_eq!(kept, [METRIC_NAME_LABEL, BUCKET_LABEL]);
+    }
+
+    #[test]
+    fn common_float_labels_do_not_allocate() {
+        let cases = [
+            (MetricType::Summary, QUANTILE_LABEL, "0", "0.0"),
+            (MetricType::Summary, QUANTILE_LABEL, "1", "1.0"),
+            (MetricType::Histogram, BUCKET_LABEL, "1", "1.0"),
+            (MetricType::Histogram, BUCKET_LABEL, "-1", "-1.0"),
+            (MetricType::Histogram, BUCKET_LABEL, "+Inf", "+Inf"),
+            (MetricType::Summary, QUANTILE_LABEL, "nan", "NaN"),
+        ];
+        for (metric_type, name, raw, want) in cases {
+            let normalized = normalize_float_label(metric_type, name, Cow::Borrowed(raw));
+            assert!(
+                matches!(normalized, Cow::Borrowed(text) if text == want),
+                "{raw}"
+            );
+        }
     }
 }
