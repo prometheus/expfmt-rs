@@ -1041,4 +1041,23 @@ mod tests {
             assert_eq!(out.as_str(), want);
         }
     }
+
+    #[test]
+    fn borrowed_labels_outlive_clear() {
+        let input = b"# TYPE h histogram\nh{le=\"1\"} 1\n";
+        let mut parser = PromParser::new(input);
+        let mut buf = LabelsBuffer::new();
+        parser.next_entry().unwrap();
+        parser.next_entry().unwrap();
+        parser.labels(&mut buf);
+        let mut kept = Vec::new();
+        for (name, value) in buf.as_slice() {
+            if let Cow::Borrowed(name) = name {
+                kept.push(*name);
+            }
+            assert_eq!(matches!(value, Cow::Owned(_)), name == BUCKET_LABEL);
+        }
+        buf.clear();
+        assert_eq!(kept, [METRIC_NAME_LABEL, BUCKET_LABEL]);
+    }
 }

@@ -159,6 +159,12 @@ impl<'a> LabelsBuffer<'a> {
             .map(|(name, value)| (name.as_ref(), value.as_ref()))
     }
 
+    /// Returns the labels with their `Cow` kind, so callers can keep `Cow::Borrowed`
+    /// slices for `'a` after [`LabelsBuffer::clear`].
+    pub fn as_slice(&self) -> &[(Cow<'a, str>, Cow<'a, str>)] {
+        &self.labels
+    }
+
     /// Returns the number of labels.
     pub fn len(&self) -> usize {
         self.labels.len()
