@@ -204,7 +204,9 @@ func copyDirFiles(srcDir, dstDir, outRoot string) ([]string, error) {
 }
 
 // extractFuncInputLiteral parses srcFile with go/parser and extracts the string literal
-// assigned to `input := ...` inside funcName.
+// assigned to `input := ...` at the top level of funcName, followed by every top-level
+// `input += ...` literal, in source order. Assignments inside nested blocks are ignored
+// because they belong to subtests or conditional paths, not to the shared input.
 func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 	fset := token.NewFileSet()
 	fileNode, err := parser.ParseFile(fset, srcFile, nil, 0)
@@ -219,26 +221,29 @@ func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 		}
 		var extracted string
 		var found bool
-		ast.Inspect(fn.Body, func(node ast.Node) bool {
-			if found {
-				return false
-			}
-			assign, ok := node.(*ast.AssignStmt)
+		for _, stmt := range fn.Body.List {
+			assign, ok := stmt.(*ast.AssignStmt)
 			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
-				return true
+				continue
 			}
 			ident, ok := assign.Lhs[0].(*ast.Ident)
 			if !ok || ident.Name != "input" {
-				return true
+				continue
+			}
+			pos := fset.Position(assign.Pos())
+			if !found && assign.Tok != token.DEFINE {
+				continue
+			}
+			if found && assign.Tok != token.ADD_ASSIGN {
+				return "", fmt.Errorf("%s: unsupported input %s in %s", pos, assign.Tok, funcName)
 			}
 			val, ok := evalStringExpr(assign.Rhs[0])
-			if ok {
-				extracted = val
-				found = true
-				return false
+			if !ok {
+				return "", fmt.Errorf("%s: input %s with a non-literal expression in %s", pos, assign.Tok, funcName)
 			}
-			return true
-		})
+			extracted += val
+			found = true
+		}
 		if found {
 			return extracted, nil
 		}
