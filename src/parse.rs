@@ -19,6 +19,7 @@ use std::borrow::Cow;
 mod float;
 #[cfg(test)]
 mod go_diff_tests;
+mod promlex;
 mod promparse;
 
 pub use promparse::PromParser;
