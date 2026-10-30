@@ -11,12 +11,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:generate go run ./sync_testdata.go
+//go:generate go run .
 
 // Command sync_testdata resolves the pinned github.com/prometheus/common and
 // github.com/prometheus/prometheus modules from go.mod, copies their expfmt and
 // model/textparse testdata files, and extracts canonical parser test inputs from
 // model/textparse/*_test.go into the repository's top-level testdata/ directory.
+// It also writes the entries textparse.NewPromParser returns for each Prometheus
+// text fixture to testdata/promparse/.
 package main
 
 import (
@@ -34,7 +36,6 @@ import (
 	"strings"
 
 	_ "github.com/prometheus/common/expfmt"
-	_ "github.com/prometheus/prometheus/model/textparse"
 )
 
 type moduleInfo struct {
@@ -126,6 +127,12 @@ func run() error {
 		synced = append(synced, filepath.ToSlash(rel))
 	}
 
+	promParseFiles, err := writePromParseExpected(outRoot)
+	if err != nil {
+		return err
+	}
+	synced = append(synced, promParseFiles...)
+
 	sort.Strings(synced)
 	m := manifest{
 		Modules: map[string]string{
@@ -212,11 +219,11 @@ func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 		}
 		var extracted string
 		var found bool
-		ast.Inspect(fn.Body, func(n ast.Node) bool {
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
 			if found {
 				return false
 			}
-			assign, ok := n.(*ast.AssignStmt)
+			assign, ok := node.(*ast.AssignStmt)
 			if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
 				return true
 			}
@@ -241,25 +248,25 @@ func extractFuncInputLiteral(srcFile, funcName string) (string, error) {
 }
 
 func evalStringExpr(expr ast.Expr) (string, bool) {
-	switch e := expr.(type) {
+	switch typedExpr := expr.(type) {
 	case *ast.BasicLit:
-		if e.Kind != token.STRING {
+		if typedExpr.Kind != token.STRING {
 			return "", false
 		}
-		s, err := strconv.Unquote(e.Value)
+		unquoted, err := strconv.Unquote(typedExpr.Value)
 		if err != nil {
 			return "", false
 		}
-		return s, true
+		return unquoted, true
 	case *ast.BinaryExpr:
-		if e.Op != token.ADD {
+		if typedExpr.Op != token.ADD {
 			return "", false
 		}
-		left, ok := evalStringExpr(e.X)
+		left, ok := evalStringExpr(typedExpr.X)
 		if !ok {
 			return "", false
 		}
-		right, ok := evalStringExpr(e.Y)
+		right, ok := evalStringExpr(typedExpr.Y)
 		if !ok {
 			return "", false
 		}

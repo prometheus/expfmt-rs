@@ -37,7 +37,7 @@ Decoding is split into three chained layers so streaming callers pay zero per-sa
                                      │
                                      ▼
         ┌─────────────────────────────────────────────────────────┐
-        │  Layer 0: Streaming event parser (textparse / proto)    │
+        │  Layer 0: Streaming event parser (text / proto)         │
         │  - Zero-copy borrowed slices (&[u8] / &str)             │
         │  - Yields Entry::{Help, Type, Unit, Series, Histogram}  │
         │  - Pre-allocation metric relabel and drop hook          │
@@ -63,7 +63,7 @@ Decoding is split into three chained layers so streaming callers pay zero per-sa
 
 ### Layer 0: Zero-copy streaming parser
 
-Modeled on Prometheus's [`model/textparse.Parser`](https://github.com/prometheus/prometheus/blob/main/model/textparse/interface.go), the low-level parser advances entry-by-entry over a byte slice without allocating per sample:
+Modeled on Prometheus's [`model/textparse.Parser`](https://github.com/prometheus/prometheus/blob/main/model/textparse/interface.go), the low-level parser advances entry-by-entry over a byte slice without allocating per sample. It is internal to the crate; the Arrow and `dto` decoders are the public API:
 
 ```rust
 pub enum Entry {
@@ -79,7 +79,7 @@ pub trait Parser<'a> {
     /// Advances to the next entry in the exposition stream, returning `Ok(None)` at EOF.
     fn next_entry(&mut self) -> Result<Option<Entry>, ParseError>;
 
-    fn help(&self) -> (&'a [u8], &'a [u8]);
+    fn help(&self) -> (&'a [u8], Cow<'a, [u8]>);
     fn metric_type(&self) -> (&'a [u8], MetricType);
     fn unit(&self) -> (&'a [u8], &'a [u8]);
     fn comment(&self) -> &'a [u8];
@@ -94,7 +94,7 @@ pub trait Parser<'a> {
     fn start_timestamp(&self) -> Option<i64>;
 
     /// Populates the caller's reusable label buffer for the current sample.
-    fn labels(&self, buf: &mut LabelsBuffer<'a>) -> Result<(), ParseError>;
+    fn labels(&self, buf: &mut LabelsBuffer<'a>);
 
     /// Iterates over exemplars attached to the current sample.
     fn exemplars(&self, buf: &mut ExemplarsBuffer<'a>) -> Result<(), ParseError>;

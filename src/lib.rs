@@ -16,3 +16,6 @@
 #[cfg(feature = "dto")]
 pub mod dto;
 pub mod format;
+// The Arrow and dto decoders (#7, #8) are the public API and will use this parser.
+#[allow(dead_code, unused_imports)]
+pub(crate) mod parse;
