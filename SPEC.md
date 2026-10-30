@@ -37,7 +37,7 @@ Decoding is split into three chained layers so streaming callers pay zero per-sa
                                      │
                                      ▼
         ┌─────────────────────────────────────────────────────────┐
-        │  Layer 0: Streaming event parser (textparse / proto)    │
+        │  Layer 0: Streaming event parser (text / proto)         │
         │  - Zero-copy borrowed slices (&[u8] / &str)             │
         │  - Yields Entry::{Help, Type, Unit, Series, Histogram}  │
         │  - Pre-allocation metric relabel and drop hook          │
