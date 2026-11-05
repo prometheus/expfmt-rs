@@ -95,8 +95,18 @@ impl ActiveParserState {
 
     fn take_scratch_into(&mut self, decoder: &mut ArrowDecoder) {
         match std::mem::replace(self, Self::Invalid) {
-            Self::Prom(mut state) => decoder.prom_spans = state.take_scratch(),
-            Self::OpenMetrics(mut state) => decoder.om_scratch = state.take_scratch(),
+            Self::Prom(mut state) => {
+                let scratch = state.take_scratch();
+                if scratch.capacity() > decoder.prom_spans.capacity() {
+                    decoder.prom_spans = scratch;
+                }
+            }
+            Self::OpenMetrics(mut state) => {
+                let scratch = state.take_scratch();
+                if scratch.retained_memory_bytes() > decoder.om_scratch.retained_memory_bytes() {
+                    decoder.om_scratch = scratch;
+                }
+            }
             Self::Invalid => {}
         }
     }
@@ -116,6 +126,8 @@ pub struct DecodeCursor {
     opts: DecodeOptions,
     default_ts_ns: Option<i64>,
     max_data_points: usize,
+    scrape_id: u64,
+    input_len: Option<usize>,
     pos: usize,
     chunked: bool,
     pending_series: bool,
@@ -264,6 +276,7 @@ impl<'input> ActiveParser<'input> {
 /// string interners, and column staging buffers so steady-state scrapes allocate only the output
 /// Arrow `Buffer`s returned inside [`OtapMetricRecords`].
 pub struct ArrowDecoder {
+    scrape_id: u64,
     prom_spans: Vec<LabelSpan>,
     om_scratch: OmScratch,
     unescape_buf: Vec<u8>,
@@ -307,6 +320,7 @@ impl ArrowDecoder {
     #[must_use]
     pub fn with_capacity(metrics: usize, data_points: usize, attrs: usize) -> Self {
         Self {
+            scrape_id: 0,
             prom_spans: Vec::with_capacity(16),
             om_scratch: OmScratch::default(),
             unescape_buf: Vec::new(),
@@ -495,6 +509,22 @@ impl ArrowDecoder {
         if cursor.done {
             return Ok(DecodeStep::Done);
         }
+        if cursor.scrape_id != self.scrape_id {
+            cursor.done = true;
+            cursor.parser_state.take_scratch_into(self);
+            return Err(DecodeError::Syntax {
+                expected: "active decode cursor for current decoder scrape",
+                offset: cursor.pos,
+            });
+        }
+        let expected_len = *cursor.input_len.get_or_insert(input.len());
+        if input.len() != expected_len || cursor.pos > input.len() {
+            self.finish_decode(cursor);
+            return Err(DecodeError::Syntax {
+                expected: "unchanged scrape input buffer across decode steps",
+                offset: cursor.pos,
+            });
+        }
         let state = std::mem::replace(&mut cursor.parser_state, ActiveParserState::Invalid);
         let mut parser = state.into_parser(input);
         let res = if cursor.chunked {
@@ -543,7 +573,9 @@ impl ArrowDecoder {
         cursor.parser_state.take_scratch_into(self);
         if !cursor.done {
             cursor.done = true;
-            self.reset_scrape();
+            if cursor.scrape_id == self.scrape_id {
+                self.reset_scrape();
+            }
         }
     }
 
@@ -610,6 +642,8 @@ impl ArrowDecoder {
             opts: *opts,
             default_ts_ns,
             max_data_points,
+            scrape_id: self.scrape_id,
+            input_len: None,
             pos: 0,
             chunked,
             pending_series: false,
@@ -646,6 +680,7 @@ impl ArrowDecoder {
     }
 
     fn reset_scrape(&mut self) {
+        self.scrape_id = self.scrape_id.wrapping_add(1);
         self.current_family.clear();
         self.assembly.clear();
         self.reset_batch();
