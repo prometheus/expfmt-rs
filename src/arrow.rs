@@ -414,12 +414,29 @@ impl ArrowDecoder {
         budget: DecodeBudget,
         mut yield_to_runtime: impl FnMut() -> Y,
     ) -> Result<OtapMetricRecords, DecodeError> {
+        struct CursorDropGuard<'dec> {
+            decoder: &'dec mut ArrowDecoder,
+            cursor: DecodeCursor,
+        }
+        impl Drop for CursorDropGuard<'_> {
+            fn drop(&mut self) {
+                self.decoder.finish_decode(&mut self.cursor);
+            }
+        }
+
         if input.len() <= budget.max_bytes {
             return self.decode(input, format, opts);
         }
-        let mut cursor = self.start_decode(format, opts)?;
+        let cursor = self.start_decode(format, opts)?;
+        let mut guard = CursorDropGuard {
+            decoder: self,
+            cursor,
+        };
         loop {
-            match self.step_decode(&mut cursor, input, budget)? {
+            match guard
+                .decoder
+                .step_decode(&mut guard.cursor, input, budget)?
+            {
                 DecodeStep::Pending => yield_to_runtime().await,
                 DecodeStep::Batch(records) => return Ok(records),
                 DecodeStep::Done => return Ok(OtapMetricRecords::default()),
