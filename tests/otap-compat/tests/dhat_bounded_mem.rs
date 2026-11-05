@@ -161,9 +161,11 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         // `next_cooperative`) keeps retained decoder scratch memory and live heap strictly
         // constant across repeated scrapes.
         let coop_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
+        let mut owned_coop_decoder = ArrowDecoder::new();
         let coop_budget = DecodeBudget::default().with_max_entries(64);
         let coop_handle = tokio::task::spawn_local(async move {
             let mut warmup_coop_dec_mem = 0usize;
+            let mut warmup_owned_dec_mem = 0usize;
             let mut warmup_coop_live_heap = 0usize;
 
             for i in 0..32 {
@@ -187,17 +189,41 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
                     }
                 }
 
+                {
+                    let mut stream = owned_coop_decoder.decode_stream(
+                        &full_237_coop,
+                        &Format::TEXT,
+                        &stream_opts,
+                    );
+                    while let Some(chunk_res) = stream
+                        .next_cooperative(coop_budget, tokio::task::yield_now)
+                        .await
+                    {
+                        let chunk = chunk_res.expect("next_cooperative chunk succeeds");
+                        let otap = to_otap_arrow_records(&chunk);
+                        drop(otap);
+                        drop(chunk);
+                    }
+                }
+
                 let dec_mem = coop_decoder.borrow().retained_memory_bytes();
+                let owned_dec_mem = owned_coop_decoder.retained_memory_bytes();
                 let live_heap = dhat::HeapStats::get().curr_bytes;
 
                 if i == 1 {
                     warmup_coop_dec_mem = dec_mem;
+                    warmup_owned_dec_mem = owned_dec_mem;
                     warmup_coop_live_heap = live_heap;
                     assert!(warmup_coop_dec_mem > 0);
+                    assert!(warmup_owned_dec_mem > 0);
                 } else if i > 1 {
                     assert_eq!(
                         dec_mem, warmup_coop_dec_mem,
                         "cooperative streaming decoder scratch memory grew at iteration {i}"
+                    );
+                    assert_eq!(
+                        owned_dec_mem, warmup_owned_dec_mem,
+                        "next_cooperative decoder scratch memory grew at iteration {i}"
                     );
                     assert_eq!(
                         live_heap, warmup_coop_live_heap,
