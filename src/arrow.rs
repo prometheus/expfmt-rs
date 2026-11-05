@@ -94,9 +94,9 @@ impl ActiveParserState {
     }
 
     fn take_scratch_into(&mut self, decoder: &mut ArrowDecoder) {
-        match self {
-            Self::Prom(state) => decoder.prom_spans = state.take_scratch(),
-            Self::OpenMetrics(state) => decoder.om_scratch = state.take_scratch(),
+        match std::mem::replace(self, Self::Invalid) {
+            Self::Prom(mut state) => decoder.prom_spans = state.take_scratch(),
+            Self::OpenMetrics(mut state) => decoder.om_scratch = state.take_scratch(),
             Self::Invalid => {}
         }
     }
@@ -503,9 +503,11 @@ impl ArrowDecoder {
     /// Ends an active [`DecodeCursor`] and reclaims its internal parser scratch buffers into
     /// `self`.
     pub fn finish_decode(&mut self, cursor: &mut DecodeCursor) {
-        cursor.done = true;
         cursor.parser_state.take_scratch_into(self);
-        self.reset_scrape();
+        if !cursor.done {
+            cursor.done = true;
+            self.reset_scrape();
+        }
     }
 
     /// Streams `input` as a sequence of non-empty [`OtapMetricRecords`] chunks bounded by
