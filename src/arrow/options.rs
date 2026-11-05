@@ -24,7 +24,7 @@ use crate::parse::ParseError;
 /// [`super::ArrowDecoder::decode_stream`].
 pub const DEFAULT_MAX_DATA_POINTS_PER_BATCH: usize = 16_384;
 
-/// Default maximum number of Layer 0 [`crate::parse::Entry`] items processed per cooperative step
+/// Default maximum number of Layer 0 `Entry` items processed per cooperative step
 /// in [`DecodeBudget::default`].
 pub const DEFAULT_DECODE_BUDGET_MAX_ENTRIES: usize = 128;
 
@@ -46,7 +46,7 @@ pub const DEFAULT_DECODE_BUDGET_MAX_DURATION: Duration = Duration::from_millis(1
 /// are clamped to `1` during step execution so every step makes forward progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeBudget {
-    /// Maximum number of Layer 0 [`crate::parse::Entry`] items processed per step.
+    /// Maximum number of Layer 0 `Entry` items processed per step.
     pub max_entries: usize,
     /// Maximum input bytes consumed per step, and the payload threshold at or below which
     /// [`super::ArrowDecoder::decode_cooperative`] takes the single-pass synchronous fast path.

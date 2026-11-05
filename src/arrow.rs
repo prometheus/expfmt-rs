@@ -65,7 +65,7 @@ type SpanAndTraceId = (Option<[u8; 8]>, Option<[u8; 16]>);
 // in `DecodeStream::next` so finalizing a batch does not add an extra heap allocation.
 #[allow(clippy::large_enum_variant)]
 pub enum DecodeStep {
-    /// The [`DecodeBudget`] was reached at an [`Entry`] boundary before a batch boundary or
+    /// The [`DecodeBudget`] was reached at an `Entry` boundary before a batch boundary or
     /// end-of-input; yield to the runtime and call `step` again.
     Pending,
     /// A [`OtapMetricRecords`] batch was finalized. Call `step` again until [`DecodeStep::Done`]
@@ -330,8 +330,8 @@ impl ArrowDecoder {
     ///
     /// # Contiguous families and batching
     ///
-    /// Input parsing streams `Entry` items one by one from [`PromParser`] or
-    /// [`OpenMetricsParser`] directly into reusable columnar staging vectors and label string
+    /// Input parsing streams `Entry` items one by one from `PromParser` or
+    /// `OpenMetricsParser` directly into reusable columnar staging vectors and label string
     /// interners without materializing intermediate per-sample structs or per-string allocations.
     /// Metric families are decoded as contiguous runs, with `# HELP`, `# TYPE`, and `# UNIT`
     /// lines appearing before that family's samples. Non-contiguous repetitions of an earlier
@@ -377,7 +377,7 @@ impl ArrowDecoder {
 
     /// Cooperatively decodes a single exposition scrape buffer of `format` into OTAP metric
     /// [`arrow_array::RecordBatch`]es, yielding via `yield_to_runtime` whenever `budget` is
-    /// exhausted at an [`Entry`] boundary.
+    /// exhausted at an `Entry` boundary.
     ///
     /// When `input.len() <= budget.max_bytes` (`64 KiB` under [`DecodeBudget::default`]), this
     /// method takes the single-pass synchronous fast path via [`ArrowDecoder::decode`] with zero
@@ -439,7 +439,7 @@ impl ArrowDecoder {
     }
 
     /// Advances `cursor` over `input` by at most `budget` entries, bytes, or duration, pausing at
-    /// [`Entry`] boundaries.
+    /// `Entry` boundaries.
     ///
     /// Internal parser scratch buffers are automatically returned to `self` once `cursor` reaches
     /// end-of-input or encounters an error. If `cursor` is abandoned early before completion,
@@ -1515,7 +1515,7 @@ impl DecodeStream<'_, '_> {
 
     /// Advances parsing and metric family assembly until a chunk is ready
     /// ([`DecodeStep::Batch`]), end-of-input is reached ([`DecodeStep::Done`]), or `budget` is
-    /// exhausted at an [`Entry`] boundary ([`DecodeStep::Pending`]).
+    /// exhausted at an `Entry` boundary ([`DecodeStep::Pending`]).
     ///
     /// # Errors
     ///
@@ -1550,7 +1550,7 @@ impl DecodeStream<'_, '_> {
     }
 
     /// Cooperatively pulls the next non-empty [`OtapMetricRecords`] chunk from the stream,
-    /// awaiting `yield_to_runtime()` each time `budget` is exhausted at an [`Entry`] boundary.
+    /// awaiting `yield_to_runtime()` each time `budget` is exhausted at an `Entry` boundary.
     pub async fn next_cooperative<Y: Future<Output = ()>>(
         &mut self,
         budget: DecodeBudget,
