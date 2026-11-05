@@ -11,7 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Configuration policies, [`DecodeOptions`], and [`DecodeError`] for [`super::ArrowDecoder`].
+//! Configuration policies, [`DecodeOptions`], [`DecodeBudget`], and [`DecodeError`] for
+//! [`super::ArrowDecoder`].
+
+use std::time::Duration;
 
 use arrow_schema::ArrowError;
 
@@ -20,6 +23,105 @@ use crate::parse::ParseError;
 /// Default upper bound on data points emitted per [`super::OtapMetricRecords`] chunk in
 /// [`super::ArrowDecoder::decode_stream`].
 pub const DEFAULT_MAX_DATA_POINTS_PER_BATCH: usize = 16_384;
+
+/// Default maximum number of Layer 0 [`crate::parse::Entry`] items processed per cooperative step
+/// in [`DecodeBudget::default`].
+pub const DEFAULT_DECODE_BUDGET_MAX_ENTRIES: usize = 128;
+
+/// Default maximum number of input bytes consumed per cooperative step in
+/// [`DecodeBudget::default`], and the synchronous fast-path threshold in
+/// [`super::ArrowDecoder::decode_cooperative`].
+pub const DEFAULT_DECODE_BUDGET_MAX_BYTES: usize = 64 * 1024;
+
+/// Default maximum wall-clock duration per cooperative step in [`DecodeBudget::default`].
+pub const DEFAULT_DECODE_BUDGET_MAX_DURATION: Duration = Duration::from_millis(1);
+
+/// Cooperative step budget bounding how much work [`super::DecodeStream::step`],
+/// [`super::ArrowDecoder::step_decode`], [`super::ArrowDecoder::decode_cooperative`], and
+/// [`super::DecodeStream::next_cooperative`] perform before yielding back to the caller's event
+/// loop.
+///
+/// Defaults match `otel-arrow`'s `DecodeBudget::default()` (`max_entries = 128`,
+/// `max_bytes = 64 KiB`, `max_duration = 1ms`). Values of `0` for `max_entries` or `max_bytes`
+/// are clamped to `1` during step execution so every step makes forward progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeBudget {
+    /// Maximum number of Layer 0 [`crate::parse::Entry`] items processed per step.
+    pub max_entries: usize,
+    /// Maximum input bytes consumed per step, and the payload threshold at or below which
+    /// [`super::ArrowDecoder::decode_cooperative`] takes the single-pass synchronous fast path.
+    pub max_bytes: usize,
+    /// Maximum wall-clock duration per step, checked every 16 entries (or after every entry when
+    /// set to [`Duration::ZERO`]).
+    pub max_duration: Duration,
+}
+
+impl Default for DecodeBudget {
+    fn default() -> Self {
+        Self::default_budget()
+    }
+}
+
+impl DecodeBudget {
+    /// Creates a [`DecodeBudget`] with explicit entry, byte, and duration limits.
+    #[must_use]
+    pub const fn new(max_entries: usize, max_bytes: usize, max_duration: Duration) -> Self {
+        Self {
+            max_entries,
+            max_bytes,
+            max_duration,
+        }
+    }
+
+    /// Creates the default [`DecodeBudget`] (`128` entries, `64 KiB`, `1ms`).
+    #[must_use]
+    pub const fn default_budget() -> Self {
+        Self::new(
+            DEFAULT_DECODE_BUDGET_MAX_ENTRIES,
+            DEFAULT_DECODE_BUDGET_MAX_BYTES,
+            DEFAULT_DECODE_BUDGET_MAX_DURATION,
+        )
+    }
+
+    /// Sets the maximum number of Layer 0 entries processed per step.
+    #[must_use]
+    pub const fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries;
+        self
+    }
+
+    /// Sets the maximum number of input bytes consumed per step.
+    #[must_use]
+    pub const fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// Sets the maximum wall-clock duration per step.
+    #[must_use]
+    pub const fn with_max_duration(mut self, max_duration: Duration) -> Self {
+        self.max_duration = max_duration;
+        self
+    }
+
+    /// Returns the maximum number of Layer 0 entries processed per step.
+    #[must_use]
+    pub const fn max_entries(&self) -> usize {
+        self.max_entries
+    }
+
+    /// Returns the maximum number of input bytes consumed per step.
+    #[must_use]
+    pub const fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Returns the maximum wall-clock duration per step.
+    #[must_use]
+    pub const fn max_duration(&self) -> Duration {
+        self.max_duration
+    }
+}
 
 /// Policy controlling how counter `_total` suffixes are emitted on `UnivariateMetrics.name`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

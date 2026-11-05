@@ -604,3 +604,306 @@ fn interleaved_histogram_lines_and_group_rehashing_assemble_correctly() {
         assert_eq!(sums.value(i), (i as f64) * 10.0 + 0.5);
     }
 }
+
+#[test]
+fn decode_budget_defaults_and_builders() {
+    let default_budget = DecodeBudget::default();
+    assert_eq!(
+        default_budget.max_entries(),
+        DEFAULT_DECODE_BUDGET_MAX_ENTRIES
+    );
+    assert_eq!(default_budget.max_bytes(), DEFAULT_DECODE_BUDGET_MAX_BYTES);
+    assert_eq!(
+        default_budget.max_duration(),
+        DEFAULT_DECODE_BUDGET_MAX_DURATION
+    );
+
+    let custom = DecodeBudget::new(32, 4096, std::time::Duration::from_micros(500))
+        .with_max_entries(16)
+        .with_max_bytes(2048)
+        .with_max_duration(std::time::Duration::from_millis(2));
+    assert_eq!(custom.max_entries(), 16);
+    assert_eq!(custom.max_bytes(), 2048);
+    assert_eq!(custom.max_duration(), std::time::Duration::from_millis(2));
+}
+
+#[test]
+fn decode_stream_step_respects_entry_byte_and_duration_budgets() {
+    let payload = concat!(
+        "# HELP req_total Total HTTP requests.\n",
+        "# TYPE req_total counter\n",
+        "req_total{shard=\"0\"} 10\n",
+        "req_total{shard=\"1\"} 20\n",
+        "# TYPE lat histogram\n",
+        "lat_bucket{le=\"1\"} 2\n",
+        "lat_bucket{le=\"+Inf\"} 5\n",
+        "lat_sum 3.5\n",
+        "lat_count 5\n",
+    );
+    let bytes = payload.as_bytes();
+    let opts = DecodeOptions::new()
+        .with_timestamp_ms(1_700_000_000_000)
+        .with_max_data_points_per_batch(2);
+
+    let mut dec = ArrowDecoder::new();
+    let expected: Vec<OtapMetricRecords> = dec
+        .decode_stream(bytes, &Format::TEXT, &opts)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(expected.len(), 2);
+
+    // 1. Entry budget (`max_entries = 1`, `max_bytes = 0` clamped to 1).
+    for budget in [
+        DecodeBudget::default().with_max_entries(1),
+        DecodeBudget::new(0, 0, std::time::Duration::from_secs(60)),
+        DecodeBudget::default().with_max_duration(std::time::Duration::ZERO),
+        DecodeBudget::default().with_max_bytes(16),
+    ] {
+        let mut stream = dec.decode_stream(bytes, &Format::TEXT, &opts);
+        let mut pending_count = 0usize;
+        let mut got_batches = Vec::new();
+        let mut prev_pos = 0usize;
+
+        loop {
+            match stream.step(budget).unwrap() {
+                DecodeStep::Pending => {
+                    pending_count += 1;
+                    assert!(stream.pos() >= prev_pos);
+                    prev_pos = stream.pos();
+                }
+                DecodeStep::Batch(batch) => {
+                    assert!(stream.pos() >= prev_pos);
+                    prev_pos = stream.pos();
+                    got_batches.push(batch);
+                }
+                DecodeStep::Done => {
+                    assert_eq!(stream.pos(), bytes.len());
+                    break;
+                }
+            }
+        }
+        assert!(pending_count > 0, "expected Pending steps for {budget:?}");
+        assert_eq!(got_batches, expected, "mismatch for {budget:?}");
+        assert_eq!(stream.step(budget).unwrap(), DecodeStep::Done);
+    }
+
+    // Init errors and syntax errors fuse `step()`.
+    let mut bad_stream = dec.decode_stream(b"m 1\n", &Format::UNKNOWN, &opts);
+    assert!(matches!(
+        bad_stream.step(DecodeBudget::default()),
+        Err(DecodeError::UnsupportedFormat(_))
+    ));
+    assert_eq!(
+        bad_stream.step(DecodeBudget::default()).unwrap(),
+        DecodeStep::Done
+    );
+}
+
+#[test]
+fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
+    struct OwnedDecodeJob {
+        payload: Vec<u8>,
+        decoder: ArrowDecoder,
+        cursor: DecodeCursor,
+    }
+
+    let om_payload = concat!(
+        "# HELP rpc_seconds RPC latency.\n",
+        "# UNIT rpc_seconds seconds\n",
+        "# TYPE rpc_seconds histogram\n",
+        "rpc_seconds_bucket{service=\"auth\",le=\"0.1\"} 3 1710000000.0 # {trace_id=\"0102030405060708090a0b0c0d0e0f10\"} 0.05 1709999999.0\n",
+        "rpc_seconds_bucket{service=\"auth\",le=\"+Inf\"} 4 1710000000.0\n",
+        "rpc_seconds_sum{service=\"auth\"} 0.42 1710000000.0\n",
+        "rpc_seconds_count{service=\"auth\"} 4 1710000000.0\n",
+        "rpc_seconds_created{service=\"auth\"} 1709000000.0\n",
+        "# TYPE calls counter\n",
+        "calls_total{service=\"auth\"} 9 1710000000.0\n",
+        "calls_created{service=\"auth\"} 1709000000.0\n",
+        "# EOF\n",
+    );
+
+    let opts = DecodeOptions::new();
+    let mut ref_dec = ArrowDecoder::new();
+    let expected_single = ref_dec
+        .decode(om_payload.as_bytes(), &Format::OPEN_METRICS_1_0_0, &opts)
+        .unwrap();
+
+    // 1. Single-batch `start_decode` driven 1 entry at a time on an owned struct.
+    let mut decoder = ArrowDecoder::new();
+    let cursor = decoder
+        .start_decode(&Format::OPEN_METRICS_1_0_0, &opts)
+        .unwrap();
+    let mut job = OwnedDecodeJob {
+        payload: om_payload.as_bytes().to_vec(),
+        decoder,
+        cursor,
+    };
+    let budget = DecodeBudget::default().with_max_entries(1);
+    let mut pending_steps = 0usize;
+    let mut single_out = None;
+    while !job.cursor.is_done() {
+        match job
+            .decoder
+            .step_decode(&mut job.cursor, &job.payload, budget)
+            .unwrap()
+        {
+            DecodeStep::Pending => pending_steps += 1,
+            DecodeStep::Batch(records) => {
+                assert!(single_out.replace(records).is_none());
+            }
+            DecodeStep::Done => break,
+        }
+    }
+    assert!(pending_steps >= 6);
+    assert_eq!(job.cursor.pos(), job.payload.len());
+    assert!(job.cursor.is_done());
+    assert_eq!(single_out.unwrap(), expected_single);
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut job.cursor, &job.payload, budget)
+            .unwrap(),
+        DecodeStep::Done
+    );
+
+    // 2. Chunked `start_decode_stream` driven 1 entry at a time.
+    let stream_opts = opts.with_max_data_points_per_batch(1);
+    let expected_chunks: Vec<_> = ref_dec
+        .decode_stream(
+            om_payload.as_bytes(),
+            &Format::OPEN_METRICS_1_0_0,
+            &stream_opts,
+        )
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut stream_cursor = job
+        .decoder
+        .start_decode_stream(&Format::OPEN_METRICS_1_0_0, &stream_opts)
+        .unwrap();
+    let mut got_chunks = Vec::new();
+    loop {
+        match job
+            .decoder
+            .step_decode(&mut stream_cursor, &job.payload, budget)
+            .unwrap()
+        {
+            DecodeStep::Pending => {}
+            DecodeStep::Batch(chunk) => got_chunks.push(chunk),
+            DecodeStep::Done => break,
+        }
+    }
+    assert_eq!(got_chunks, expected_chunks);
+
+    // 3. Aborting a cursor early via `finish_decode` reclaims parser scratch capacity.
+    let mut aborted = job
+        .decoder
+        .start_decode(&Format::OPEN_METRICS_1_0_0, &opts)
+        .unwrap();
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut aborted, &job.payload, budget)
+            .unwrap(),
+        DecodeStep::Pending
+    );
+    job.decoder.finish_decode(&mut aborted);
+    assert!(aborted.is_done());
+    assert!(job.decoder.om_scratch.retained_memory_bytes() > 0);
+}
+
+#[test]
+fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    struct YieldOnce(bool);
+    impl Future for YieldOnce {
+        type Output = ();
+        fn poll(mut self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+            if self.0 {
+                Poll::Ready(())
+            } else {
+                self.0 = true;
+                Poll::Pending
+            }
+        }
+    }
+
+    fn drive_future<F: Future>(fut: F) -> (F::Output, usize) {
+        let mut fut = pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut polls_after_first = 0usize;
+        loop {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Ready(out) => return (out, polls_after_first),
+                Poll::Pending => polls_after_first += 1,
+            }
+        }
+    }
+
+    let mut payload = String::from("# TYPE c counter\n");
+    for i in 0..40 {
+        payload.push_str(&format!("c{{id=\"{i}\"}} {i}\n"));
+    }
+    let bytes = payload.as_bytes();
+    let opts = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
+
+    let mut dec = ArrowDecoder::new();
+    let expected = dec.decode(bytes, &Format::TEXT, &opts).unwrap();
+
+    // 1. Fast path: when `bytes.len() <= budget.max_bytes`, `decode_cooperative` completes in a
+    //    single poll with zero yields even if `max_entries = 1`.
+    let mut fast_yields = 0usize;
+    let fast_budget = DecodeBudget::default().with_max_entries(1);
+    assert!(bytes.len() <= fast_budget.max_bytes());
+    let (fast_res, fast_polls) =
+        drive_future(
+            dec.decode_cooperative(bytes, &Format::TEXT, &opts, fast_budget, || {
+                fast_yields += 1;
+                YieldOnce(false)
+            }),
+        );
+    assert_eq!(fast_res.unwrap(), expected);
+    assert_eq!(fast_yields, 0);
+    assert_eq!(fast_polls, 0);
+
+    // 2. Cooperative path: when `bytes.len() > budget.max_bytes`, `decode_cooperative` yields
+    //    between bounded steps and produces the exact same `OtapMetricRecords`.
+    let mut coop_yields = 0usize;
+    let coop_budget = DecodeBudget::new(8, 64, std::time::Duration::from_secs(60));
+    assert!(bytes.len() > coop_budget.max_bytes());
+    let (coop_res, coop_polls) =
+        drive_future(
+            dec.decode_cooperative(bytes, &Format::TEXT, &opts, coop_budget, || {
+                coop_yields += 1;
+                YieldOnce(false)
+            }),
+        );
+    assert_eq!(coop_res.unwrap(), expected);
+    assert!(coop_yields >= 5);
+    assert_eq!(coop_polls, coop_yields);
+
+    // 3. `DecodeStream::next_cooperative` yields between steps while streaming chunks.
+    let stream_opts = opts.with_max_data_points_per_batch(15);
+    let expected_chunks: Vec<_> = dec
+        .decode_stream(bytes, &Format::TEXT, &stream_opts)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut stream_yields = 0usize;
+    let (got_chunks, stream_polls) = drive_future(async {
+        let mut stream = dec.decode_stream(bytes, &Format::TEXT, &stream_opts);
+        let mut out = Vec::new();
+        while let Some(res) = stream
+            .next_cooperative(coop_budget, || {
+                stream_yields += 1;
+                YieldOnce(false)
+            })
+            .await
+        {
+            out.push(res.unwrap());
+        }
+        out
+    });
+    assert_eq!(got_chunks, expected_chunks);
+    assert!(stream_yields >= 5);
+    assert_eq!(stream_polls, stream_yields);
+}

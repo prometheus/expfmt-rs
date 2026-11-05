@@ -19,7 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::rc::Rc;
 
-use expfmt::arrow::{ArrowDecoder, DecodeOptions, OtapMetricRecords};
+use expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep, OtapMetricRecords};
 use expfmt::format::Format;
 use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords, OtapBatchStore};
 use otel_arrow_dfe_pdata::proto::opentelemetry::arrow::v1::ArrowPayloadType;
@@ -112,6 +112,7 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         // and keeps both decoder capacity and live heap constant across repeated scrapes.
         let stream_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
         let stream_opts = opts.with_max_data_points_per_batch(128);
+        let full_237_coop = Rc::clone(&full_237);
         let stream_handle = tokio::task::spawn_local(async move {
             let mut warmup_stream_dec_mem = 0usize;
             let mut warmup_stream_live_heap = 0usize;
@@ -154,6 +155,62 @@ fn local_set_non_send_repeated_scrapes_keep_bounded_memory() {
         });
 
         stream_handle.await.expect("streaming local task succeeds");
+
+        // Verify cooperative incremental streaming (`start_decode_stream` + `step_decode` across
+        // `Rc<RefCell<ArrowDecoder>>` without holding a `RefMut` across `.await`, plus owned
+        // `next_cooperative`) keeps retained decoder scratch memory and live heap strictly
+        // constant across repeated scrapes.
+        let coop_decoder = Rc::new(RefCell::new(ArrowDecoder::new()));
+        let coop_budget = DecodeBudget::default().with_max_entries(64);
+        let coop_handle = tokio::task::spawn_local(async move {
+            let mut warmup_coop_dec_mem = 0usize;
+            let mut warmup_coop_live_heap = 0usize;
+
+            for i in 0..32 {
+                let mut cursor = coop_decoder
+                    .borrow_mut()
+                    .start_decode_stream(&Format::TEXT, &stream_opts)
+                    .expect("cursor starts");
+                loop {
+                    let step = coop_decoder
+                        .borrow_mut()
+                        .step_decode(&mut cursor, &full_237_coop, coop_budget)
+                        .expect("cooperative step succeeds");
+                    match step {
+                        DecodeStep::Pending => tokio::task::yield_now().await,
+                        DecodeStep::Batch(chunk) => {
+                            let otap = to_otap_arrow_records(&chunk);
+                            drop(otap);
+                            drop(chunk);
+                        }
+                        DecodeStep::Done => break,
+                    }
+                }
+
+                let dec_mem = coop_decoder.borrow().retained_memory_bytes();
+                let live_heap = dhat::HeapStats::get().curr_bytes;
+
+                if i == 1 {
+                    warmup_coop_dec_mem = dec_mem;
+                    warmup_coop_live_heap = live_heap;
+                    assert!(warmup_coop_dec_mem > 0);
+                } else if i > 1 {
+                    assert_eq!(
+                        dec_mem, warmup_coop_dec_mem,
+                        "cooperative streaming decoder scratch memory grew at iteration {i}"
+                    );
+                    assert_eq!(
+                        live_heap, warmup_coop_live_heap,
+                        "live heap bytes leaked after cooperative streaming scrape at iteration {i}"
+                    );
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        coop_handle
+            .await
+            .expect("cooperative streaming local task succeeds");
 
         // Verify OpenMetrics 1.0 scrapes (with histograms, summaries, exemplars, and units) also
         // keep retained scratch memory and live heap strictly constant after warmup.

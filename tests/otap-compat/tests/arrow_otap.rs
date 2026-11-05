@@ -16,10 +16,13 @@
 
 use std::fs;
 use std::path::Path;
+use std::rc::Rc;
+use std::time::Duration;
 
 use expfmt::arrow::{
-    ArrowDecoder, CounterSuffixPolicy, DecodeError, DecodeOptions, MetricPayloadType,
-    OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY, UnitSuffixPolicy, UntypedPolicy,
+    ArrowDecoder, CounterSuffixPolicy, DecodeBudget, DecodeCursor, DecodeError, DecodeOptions,
+    DecodeStep, MetricPayloadType, OtapMetricRecords, PROMETHEUS_TYPE_METADATA_KEY,
+    UnitSuffixPolicy, UntypedPolicy,
 };
 use expfmt::format::Format;
 use otel_arrow_dfe_pdata::otap::{Metrics, OtapArrowRecords, OtapBatchStore};
@@ -954,4 +957,179 @@ fn decode_stream_chunks_validate_in_otap_and_handle_more_than_u16_max_metrics() 
         "Boundary counter across u16 batch split."
     );
     assert!(matches!(boundary_metric.data, Some(metric::Data::Sum(_))));
+}
+
+async fn probe_scheduling_lateness(
+    mut completed: tokio::sync::oneshot::Receiver<tokio::time::Instant>,
+    period: Duration,
+) -> (Duration, usize) {
+    let mut deadline = tokio::time::Instant::now() + period;
+    let mut max_lateness = Duration::ZERO;
+    let mut ticks = 0usize;
+
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut completed => {
+                if let Ok(done_at) = res
+                    && done_at > deadline
+                {
+                    max_lateness = max_lateness.max(done_at.duration_since(deadline));
+                }
+                return (max_lateness, ticks);
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                let now = tokio::time::Instant::now();
+                max_lateness = max_lateness.max(now.duration_since(deadline));
+                ticks += 1;
+                deadline = now + period;
+            }
+        }
+    }
+}
+
+#[test]
+fn cooperative_decode_bounds_local_set_timer_scheduling_lateness_and_validates_in_otap() {
+    struct OwnedScrapeDecodeJob {
+        payload: Rc<[u8]>,
+        decoder: ArrowDecoder,
+        cursor: DecodeCursor,
+        budget: DecodeBudget,
+    }
+
+    impl OwnedScrapeDecodeJob {
+        fn new(
+            payload: Rc<[u8]>,
+            format: &Format,
+            opts: &DecodeOptions,
+            budget: DecodeBudget,
+        ) -> Result<Self, DecodeError> {
+            let mut decoder = ArrowDecoder::new();
+            let cursor = decoder.start_decode(format, opts)?;
+            Ok(Self {
+                payload,
+                decoder,
+                cursor,
+                budget,
+            })
+        }
+
+        async fn run_cooperative(&mut self) -> Result<(OtapMetricRecords, usize), DecodeError> {
+            let mut yields = 0usize;
+            loop {
+                match self
+                    .decoder
+                    .step_decode(&mut self.cursor, &self.payload, self.budget)?
+                {
+                    DecodeStep::Pending => {
+                        yields += 1;
+                        tokio::task::yield_now().await;
+                    }
+                    DecodeStep::Batch(records) => return Ok((records, yields)),
+                    DecodeStep::Done => return Ok((OtapMetricRecords::default(), yields)),
+                }
+            }
+        }
+    }
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/textparse");
+    let full_237: Rc<[u8]> = fs::read(root.join("alltypes.237mfs.prom.txt"))
+        .unwrap()
+        .into();
+    let opts = DecodeOptions::new().with_timestamp_ms(1_700_000_000_000);
+
+    let mut sync_decoder = ArrowDecoder::new();
+    let expected_records = sync_decoder
+        .decode(&full_237, &Format::TEXT, &opts)
+        .expect("synchronous reference decode succeeds");
+    let expected_otlp = otap_to_otlp(&to_otap_arrow_records(&expected_records));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("single-threaded tokio runtime builds");
+    let local = tokio::task::LocalSet::new();
+
+    local.block_on(&rt, async move {
+        let budget = DecodeBudget::default();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let probe_handle = tokio::task::spawn_local(probe_scheduling_lateness(
+            done_rx,
+            Duration::from_micros(200),
+        ));
+
+        let payload_for_task = Rc::clone(&full_237);
+        let decode_handle = tokio::task::spawn_local(async move {
+            let mut decoder = ArrowDecoder::new();
+            let mut last_records = None;
+
+            // Run repeated cooperative full-scrape and streaming decodes so the probe timer fires
+            // across multiple cooperative yield boundaries on the same single-threaded `LocalSet`.
+            for _ in 0..8 {
+                let records = decoder
+                    .decode_cooperative(
+                        &payload_for_task,
+                        &Format::TEXT,
+                        &opts,
+                        budget,
+                        tokio::task::yield_now,
+                    )
+                    .await
+                    .expect("cooperative full decode succeeds");
+                last_records = Some(records);
+            }
+
+            let stream_opts = opts.with_max_data_points_per_batch(64);
+            let mut streamed_otlp = Vec::new();
+            {
+                let mut stream =
+                    decoder.decode_stream(&payload_for_task, &Format::TEXT, &stream_opts);
+                while let Some(chunk_res) = stream
+                    .next_cooperative(budget, tokio::task::yield_now)
+                    .await
+                {
+                    let chunk = chunk_res.expect("cooperative stream chunk succeeds");
+                    let mut otap = to_otap_arrow_records(&chunk);
+                    otap.encode_transport_optimized()
+                        .expect("cooperative chunk transport optimize succeeds");
+                    otap.decode_transport_optimized_ids()
+                        .expect("cooperative chunk transport decode succeeds");
+                    streamed_otlp.push(otap_to_otlp(&otap));
+                }
+            }
+
+            // Also verify the lifetime-free `OwnedScrapeDecodeJob` pattern (`PdataDecodeJob` style).
+            let mut job = OwnedScrapeDecodeJob::new(
+                Rc::clone(&payload_for_task),
+                &Format::TEXT,
+                &opts,
+                budget,
+            )
+            .expect("job initializes");
+            let (job_records, job_yields) = job.run_cooperative().await.expect("job succeeds");
+            assert!(job_yields > 0, "expected >0 yields for 186 KiB fixture");
+
+            let _ = done_tx.send(tokio::time::Instant::now());
+            (last_records.unwrap(), streamed_otlp, job_records)
+        });
+
+        let (coop_records, streamed_otlp, job_records) =
+            decode_handle.await.expect("decode task completes");
+        let (max_lateness, ticks) = probe_handle.await.expect("probe task completes");
+
+        assert!(
+            ticks > 0,
+            "expected timer probe to fire during cooperative decode"
+        );
+        assert!(
+            max_lateness < Duration::from_millis(50),
+            "cooperative decode scheduling lateness exceeded bound: {max_lateness:?}"
+        );
+
+        let coop_otlp = otap_to_otlp(&to_otap_arrow_records(&coop_records));
+        let job_otlp = otap_to_otlp(&to_otap_arrow_records(&job_records));
+        assert_equivalent(std::slice::from_ref(&expected_otlp), &[coop_otlp]);
+        assert_equivalent(std::slice::from_ref(&expected_otlp), &[job_otlp]);
+        assert_equivalent(&[expected_otlp], &streamed_otlp);
+    });
 }
