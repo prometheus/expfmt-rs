@@ -122,6 +122,18 @@ pub struct DecodeCursor {
     done: bool,
 }
 
+impl std::fmt::Debug for DecodeCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeCursor")
+            .field("opts", &self.opts)
+            .field("pos", &self.pos)
+            .field("chunked", &self.chunked)
+            .field("pending_series", &self.pending_series)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
 impl DecodeCursor {
     /// Returns the current byte offset of the parser cursor in `input` (`0..=input.len()`).
     #[must_use]
@@ -272,6 +284,14 @@ pub struct ArrowDecoder {
 impl Default for ArrowDecoder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Debug for ArrowDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArrowDecoder")
+            .field("retained_memory_bytes", &self.retained_memory_bytes())
+            .finish_non_exhaustive()
     }
 }
 
@@ -1506,6 +1526,17 @@ pub struct DecodeStream<'dec, 'input> {
     pending_series: bool,
     init_err: Option<DecodeError>,
     done: bool,
+}
+
+impl std::fmt::Debug for DecodeStream<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeStream")
+            .field("opts", &self.opts)
+            .field("pos", &self.pos())
+            .field("pending_series", &self.pending_series)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
 }
 
 impl DecodeStream<'_, '_> {
