@@ -687,7 +687,7 @@ fn decode_stream_step_respects_entry_byte_and_duration_budgets() {
         assert_eq!(stream.step(budget).unwrap(), DecodeStep::Done);
     }
 
-    // Init errors and syntax errors fuse `step()`.
+    // Init errors and mid-scrape syntax errors fuse `step()`.
     let mut bad_stream = dec.decode_stream(b"m 1\n", &Format::UNKNOWN, &opts);
     assert!(matches!(
         bad_stream.step(DecodeBudget::default()),
@@ -697,10 +697,44 @@ fn decode_stream_step_respects_entry_byte_and_duration_budgets() {
         bad_stream.step(DecodeBudget::default()).unwrap(),
         DecodeStep::Done
     );
+    drop(bad_stream);
+
+    let mut mid_err_stream =
+        dec.decode_stream(b"m{a=\"1\",b=\"2\"} 1\nbad_line\n", &Format::TEXT, &opts);
+    let step1 = DecodeBudget::default().with_max_entries(1);
+    assert_eq!(mid_err_stream.step(step1).unwrap(), DecodeStep::Pending);
+    assert!(matches!(
+        mid_err_stream.step(step1),
+        Err(DecodeError::Syntax { .. })
+    ));
+    assert_eq!(mid_err_stream.step(step1).unwrap(), DecodeStep::Done);
+    drop(mid_err_stream);
+
+    // Non-zero `max_duration` checks elapsed time every 16 entries (`entries.is_multiple_of(16)`).
+    let mut heavy_lines = String::new();
+    for i in 0..20 {
+        heavy_lines.push_str("m{");
+        for k in 0..32 {
+            if k > 0 {
+                heavy_lines.push(',');
+            }
+            heavy_lines.push_str(&format!("k_{k}=\"v\\\\n_{i}_{k}\""));
+        }
+        heavy_lines.push_str(&format!("}} {i}\n"));
+    }
+    let dur_budget = DecodeBudget::new(usize::MAX, usize::MAX, std::time::Duration::from_nanos(1));
+    let mut dur_stream = dec.decode_stream(
+        heavy_lines.as_bytes(),
+        &Format::TEXT,
+        &DecodeOptions::new().with_max_data_points_per_batch(64),
+    );
+    assert_eq!(dur_stream.step(dur_budget).unwrap(), DecodeStep::Pending);
+    assert!(dur_stream.pos() > 0 && dur_stream.pos() < heavy_lines.len());
 }
 
 #[test]
 fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
+    #[derive(Debug)]
     struct OwnedDecodeJob {
         payload: Vec<u8>,
         decoder: ArrowDecoder,
@@ -793,11 +827,13 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
     }
     assert_eq!(got_chunks, expected_chunks);
 
-    // 3. Aborting a cursor early via `finish_decode` reclaims parser scratch capacity.
+    // 3. Aborting a cursor early via `finish_decode` is idempotent and reclaims parser scratch
+    //    capacity, and `DecodeCursor` implements `Debug`.
     let mut aborted = job
         .decoder
         .start_decode(&Format::OPEN_METRICS_1_0_0, &opts)
         .unwrap();
+    assert!(format!("{aborted:?}").contains("DecodeCursor"));
     assert_eq!(
         job.decoder
             .step_decode(&mut aborted, &job.payload, budget)
@@ -805,8 +841,124 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
         DecodeStep::Pending
     );
     job.decoder.finish_decode(&mut aborted);
+    let retained_after_first = job.decoder.om_scratch.retained_memory_bytes();
     assert!(aborted.is_done());
-    assert!(job.decoder.om_scratch.retained_memory_bytes() > 0);
+    assert!(retained_after_first > 0);
+    job.decoder.finish_decode(&mut aborted);
+    assert_eq!(
+        job.decoder.om_scratch.retained_memory_bytes(),
+        retained_after_first
+    );
+
+    // 4. Empty or comment-only scrapes return `DecodeStep::Done` in single-batch `start_decode`.
+    let mut empty_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut empty_cursor, b"# only comment\n", budget)
+            .unwrap(),
+        DecodeStep::Pending
+    );
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut empty_cursor, b"# only comment\n", budget)
+            .unwrap(),
+        DecodeStep::Done
+    );
+    assert!(empty_cursor.is_done());
+
+    // 5. `split_assembled` and assembled-to-untyped `pending_series` transitions under `budget`.
+    let hist_and_untyped = concat!(
+        "# TYPE h histogram\n",
+        "h_bucket{id=\"1\",le=\"1\"} 1\n",
+        "h_bucket{id=\"1\",le=\"+Inf\"} 2\n",
+        "h_sum{id=\"1\"} 1.5\n",
+        "h_count{id=\"1\"} 2\n",
+        "h_bucket{id=\"2\",le=\"1\"} 3\n",
+        "h_bucket{id=\"2\",le=\"+Inf\"} 4\n",
+        "h_sum{id=\"2\"} 3.5\n",
+        "h_count{id=\"2\"} 4\n",
+        "untyped_after_hist 7\n",
+    );
+    let expected_hist_chunks: Vec<_> = ref_dec
+        .decode_stream(hist_and_untyped.as_bytes(), &Format::TEXT, &stream_opts)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(expected_hist_chunks.len(), 3);
+    let mut hist_cursor = job
+        .decoder
+        .start_decode_stream(&Format::TEXT, &stream_opts)
+        .unwrap();
+    let mut got_hist_chunks = Vec::new();
+    loop {
+        match job
+            .decoder
+            .step_decode(&mut hist_cursor, hist_and_untyped.as_bytes(), budget)
+            .unwrap()
+        {
+            DecodeStep::Pending => {}
+            DecodeStep::Batch(chunk) => got_hist_chunks.push(chunk),
+            DecodeStep::Done => break,
+        }
+    }
+    assert_eq!(got_hist_chunks, expected_hist_chunks);
+
+    // 6. Init errors, mid-scrape syntax errors, truncated input slices, and stale cursors in
+    //    `start_decode` / `step_decode`.
+    assert!(matches!(
+        job.decoder.start_decode(&Format::UNKNOWN, &opts),
+        Err(DecodeError::UnsupportedFormat(_))
+    ));
+    assert!(matches!(
+        job.decoder
+            .start_decode_stream(&Format::TEXT, &opts.with_timestamp_ms(i64::MAX)),
+        Err(DecodeError::TimestampOverflow { .. })
+    ));
+
+    let bad_bytes = b"m{a=\"1\",b=\"2\"} 1\nbad_line\n";
+    let mut err_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut err_cursor, bad_bytes, budget)
+            .unwrap(),
+        DecodeStep::Pending
+    );
+    assert!(matches!(
+        job.decoder.step_decode(&mut err_cursor, bad_bytes, budget),
+        Err(DecodeError::Syntax { .. })
+    ));
+    assert!(err_cursor.is_done());
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut err_cursor, bad_bytes, budget)
+            .unwrap(),
+        DecodeStep::Done
+    );
+
+    let mut trunc_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut trunc_cursor, bad_bytes, budget)
+            .unwrap(),
+        DecodeStep::Pending
+    );
+    let trunc_pos = trunc_cursor.pos();
+    assert!(matches!(
+        job.decoder
+            .step_decode(&mut trunc_cursor, &bad_bytes[trunc_pos..], budget),
+        Err(DecodeError::Syntax { .. })
+    ));
+    assert!(trunc_cursor.is_done());
+
+    let mut stale_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
+    let _ = job
+        .decoder
+        .decode(b"other 1\n", &Format::TEXT, &opts)
+        .unwrap();
+    assert!(matches!(
+        job.decoder.step_decode(&mut stale_cursor, b"m 1\n", budget),
+        Err(DecodeError::Syntax { .. })
+    ));
+    assert!(stale_cursor.is_done());
 }
 
 #[test]
@@ -906,4 +1058,39 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
     assert_eq!(got_chunks, expected_chunks);
     assert!(stream_yields >= 5);
     assert_eq!(stream_polls, stream_yields);
+
+    // 4. Dropping a suspended `decode_cooperative` future at `Poll::Pending` reclaims parser
+    //    scratch capacity and resets partial scrape state, and mid-scrape errors propagate after
+    //    yielding.
+    {
+        let fut = dec.decode_cooperative(bytes, &Format::TEXT, &opts, coop_budget, || {
+            YieldOnce(false)
+        });
+        let mut pinned = pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(matches!(pinned.as_mut().poll(&mut cx), Poll::Pending));
+    }
+    assert!(dec.prom_spans.capacity() > 0);
+    assert!(dec.metrics.is_empty());
+
+    let bad_coop = b"m{a=\"1\",b=\"2\",c=\"3\",d=\"4\"} 1\nbad_line\n";
+    let err_budget = DecodeBudget::new(1, 8, std::time::Duration::from_secs(60));
+    let (coop_err, err_polls) =
+        drive_future(
+            dec.decode_cooperative(bad_coop, &Format::TEXT, &opts, err_budget, || {
+                YieldOnce(false)
+            }),
+        );
+    assert!(matches!(coop_err, Err(DecodeError::Syntax { .. })));
+    assert_eq!(err_polls, 1);
+
+    let (empty_coop, empty_polls) = drive_future(dec.decode_cooperative(
+        b"# comment exceeding max_bytes threshold\n",
+        &Format::TEXT,
+        &opts,
+        err_budget,
+        || YieldOnce(false),
+    ));
+    assert!(empty_coop.unwrap().is_empty());
+    assert_eq!(empty_polls, 1);
 }
