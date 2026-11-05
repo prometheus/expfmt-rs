@@ -153,7 +153,7 @@ impl DecodeCursor {
         self.pos
     }
 
-    /// Returns `true` once the cursor has reached [`DecodeStep::Done`] or encountered an error.
+    /// Returns `true` once the cursor has reached end-of-input or encountered an error.
     #[must_use]
     pub const fn is_done(&self) -> bool {
         self.done
@@ -794,17 +794,14 @@ impl ArrowDecoder {
                     None => {
                         self.flush_pending_family(opts, default_ts_ns)?;
                         *done = true;
-                        if CHUNKED {
-                            if self.metrics.is_empty() {
-                                return Ok(DecodeStep::Done);
-                            }
-                            let batch = self.finish_batches(default_ts_ns.is_some())?;
-                            self.reset_batch();
-                            return Ok(DecodeStep::Batch(batch));
+                        if self.metrics.is_empty() {
+                            return Ok(DecodeStep::Done);
                         }
-                        return Ok(DecodeStep::Batch(
-                            self.finish_batches(default_ts_ns.is_some())?,
-                        ));
+                        let batch = self.finish_batches(default_ts_ns.is_some())?;
+                        if CHUNKED {
+                            self.reset_batch();
+                        }
+                        return Ok(DecodeStep::Batch(batch));
                     }
                 }
             };
