@@ -47,9 +47,10 @@ use self::columns::{
 use self::family::{CurrentFamily, FamilyAssembly, SeriesRole};
 use self::intern::StringInterner;
 pub use self::options::{
-    CounterSuffixPolicy, DEFAULT_DECODE_BUDGET_MAX_BYTES, DEFAULT_DECODE_BUDGET_MAX_DURATION,
-    DEFAULT_DECODE_BUDGET_MAX_ENTRIES, DEFAULT_MAX_DATA_POINTS_PER_BATCH, DecodeBudget,
-    DecodeError, DecodeOptions, UnitSuffixPolicy, UntypedPolicy,
+    CounterSuffixPolicy, DECODE_BUDGET_DURATION_CHECK_INTERVAL, DEFAULT_DECODE_BUDGET_MAX_BYTES,
+    DEFAULT_DECODE_BUDGET_MAX_DURATION, DEFAULT_DECODE_BUDGET_MAX_ENTRIES,
+    DEFAULT_MAX_DATA_POINTS_PER_BATCH, DecodeBudget, DecodeError, DecodeOptions, UnitSuffixPolicy,
+    UntypedPolicy,
 };
 pub use self::records::{MetricPayloadType, OtapMetricRecords};
 pub use self::schema::PROMETHEUS_TYPE_METADATA_KEY;
@@ -928,7 +929,7 @@ impl ArrowDecoder {
                 entries += 1;
                 let bytes_consumed = parser.pos().saturating_sub(start_pos);
                 let duration_exceeded = (budget.max_duration.is_zero()
-                    || entries.is_multiple_of(16))
+                    || entries.is_multiple_of(DECODE_BUDGET_DURATION_CHECK_INTERVAL))
                     && started.is_some_and(|t| t.elapsed() >= budget.max_duration);
                 if entries >= max_entries || bytes_consumed >= max_bytes || duration_exceeded {
                     return Ok(DecodeStep::Pending);

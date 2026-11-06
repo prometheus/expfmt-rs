@@ -35,6 +35,10 @@ pub const DEFAULT_DECODE_BUDGET_MAX_BYTES: usize = 64 * 1024;
 /// Default maximum wall-clock duration per cooperative step in [`DecodeBudget::default`].
 pub const DEFAULT_DECODE_BUDGET_MAX_DURATION: Duration = Duration::from_millis(1);
 
+/// Number of Layer 0 `Entry` items processed between wall-clock `Instant::elapsed` checks in
+/// budgeted decode steps.
+pub const DECODE_BUDGET_DURATION_CHECK_INTERVAL: usize = 16;
+
 /// Cooperative step budget bounding how much work [`super::DecodeStream::step`],
 /// [`super::ArrowDecoder::step_decode`], [`super::ArrowDecoder::decode_cooperative`], and
 /// [`super::DecodeStream::next_cooperative`] perform before yielding back to the caller's event
@@ -49,8 +53,9 @@ pub struct DecodeBudget {
     pub max_entries: usize,
     /// Maximum input bytes consumed per step.
     pub max_bytes: usize,
-    /// Maximum wall-clock duration per step, checked every 16 entries (or after every entry when
-    /// set to [`Duration::ZERO`]).
+    /// Maximum wall-clock duration per step, checked every
+    /// [`DECODE_BUDGET_DURATION_CHECK_INTERVAL`] entries (or after every entry when set to
+    /// [`Duration::ZERO`]).
     pub max_duration: Duration,
 }
 
