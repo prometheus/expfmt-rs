@@ -1011,10 +1011,10 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
     let mut dec = ArrowDecoder::new();
     let expected = dec.decode(bytes, &Format::TEXT, &opts).unwrap();
 
-    // 1. Fast path: when `bytes.len() <= budget.max_bytes`, `decode_cooperative` completes in a
-    //    single poll with zero yields even if `max_entries = 1`.
+    // 1. Single-poll path: when the scrape fits within `budget`, `decode_cooperative` completes
+    //    in a single poll with zero yields.
     let mut fast_yields = 0usize;
-    let fast_budget = DecodeBudget::default().with_max_entries(1);
+    let fast_budget = DecodeBudget::default();
     assert!(bytes.len() <= fast_budget.max_bytes);
     let (fast_res, fast_polls) =
         drive_future(
@@ -1027,11 +1027,12 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
     assert_eq!(fast_yields, 0);
     assert_eq!(fast_polls, 0);
 
-    // 2. Cooperative path: when `bytes.len() > budget.max_bytes`, `decode_cooperative` yields
-    //    between bounded steps and produces the exact same `OtapMetricRecords`.
+    // 2. Cooperative path: when `budget` is exceeded (even if `max_bytes` is raised above
+    //    `bytes.len()`), `decode_cooperative` yields between bounded steps and produces the exact
+    //    same `OtapMetricRecords`.
     let mut coop_yields = 0usize;
-    let coop_budget = DecodeBudget::new(8, 64, std::time::Duration::from_secs(60));
-    assert!(bytes.len() > coop_budget.max_bytes);
+    let coop_budget = DecodeBudget::new(5, 8 << 20, std::time::Duration::from_secs(60));
+    assert!(bytes.len() <= coop_budget.max_bytes);
     let (coop_res, coop_polls) =
         drive_future(
             dec.decode_cooperative(bytes, &Format::TEXT, &opts, coop_budget, || {

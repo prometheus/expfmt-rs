@@ -423,9 +423,8 @@ impl ArrowDecoder {
     /// [`arrow_array::RecordBatch`]es, yielding via `yield_to_runtime` whenever `budget` is
     /// exhausted at an `Entry` boundary.
     ///
-    /// When `input.len() <= budget.max_bytes` (`64 KiB` under [`DecodeBudget::default`]), this
-    /// method takes the single-pass synchronous fast path via [`ArrowDecoder::decode`] with zero
-    /// yield or timer overhead.
+    /// When the entire scrape fits within the first `budget` step, this method completes on the
+    /// first poll without invoking `yield_to_runtime`.
     ///
     /// # Errors
     ///
@@ -448,9 +447,6 @@ impl ArrowDecoder {
             }
         }
 
-        if input.len() <= budget.max_bytes {
-            return self.decode(input, format, opts);
-        }
         let cursor = self.start_decode(format, opts)?;
         let mut guard = CursorDropGuard {
             decoder: self,

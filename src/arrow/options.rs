@@ -29,8 +29,7 @@ pub const DEFAULT_MAX_DATA_POINTS_PER_BATCH: usize = 16_384;
 pub const DEFAULT_DECODE_BUDGET_MAX_ENTRIES: usize = 128;
 
 /// Default maximum number of input bytes consumed per cooperative step in
-/// [`DecodeBudget::default`], and the synchronous fast-path threshold in
-/// [`super::ArrowDecoder::decode_cooperative`].
+/// [`DecodeBudget::default`].
 pub const DEFAULT_DECODE_BUDGET_MAX_BYTES: usize = 64 * 1024;
 
 /// Default maximum wall-clock duration per cooperative step in [`DecodeBudget::default`].
@@ -48,8 +47,7 @@ pub const DEFAULT_DECODE_BUDGET_MAX_DURATION: Duration = Duration::from_millis(1
 pub struct DecodeBudget {
     /// Maximum number of Layer 0 `Entry` items processed per step.
     pub max_entries: usize,
-    /// Maximum input bytes consumed per step, and the payload threshold at or below which
-    /// [`super::ArrowDecoder::decode_cooperative`] takes the single-pass synchronous fast path.
+    /// Maximum input bytes consumed per step.
     pub max_bytes: usize,
     /// Maximum wall-clock duration per step, checked every 16 entries (or after every entry when
     /// set to [`Duration::ZERO`]).
