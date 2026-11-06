@@ -418,7 +418,7 @@ impl ArrowDecoder {
             opts,
             default_ts_ns,
             0,
-            DecodeBudget::default_budget(),
+            None,
             &mut pending_series,
             &mut done,
         );
@@ -529,14 +529,14 @@ impl ArrowDecoder {
         input: &[u8],
         budget: DecodeBudget,
     ) -> Result<DecodeStep, DecodeError> {
-        self.step_cursor::<true>(cursor, input, budget)
+        self.step_cursor::<true>(cursor, input, Some(budget))
     }
 
     fn step_cursor<const BUDGETED: bool>(
         &mut self,
         cursor: &mut DecodeCursor,
         input: &[u8],
-        budget: DecodeBudget,
+        budget: Option<DecodeBudget>,
     ) -> Result<DecodeStep, DecodeError> {
         if cursor.done {
             return Ok(DecodeStep::Done);
@@ -803,18 +803,18 @@ impl ArrowDecoder {
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
         max_data_points: usize,
-        budget: DecodeBudget,
+        budget: Option<DecodeBudget>,
         pending_series: &mut bool,
         done: &mut bool,
     ) -> Result<DecodeStep, DecodeError> {
         let start_pos = if BUDGETED { parser.pos() } else { 0 };
-        let max_entries = if BUDGETED {
-            budget.max_entries.max(1)
+        let max_entries = if let Some(b) = budget.filter(|_| BUDGETED) {
+            b.max_entries.max(1)
         } else {
             usize::MAX
         };
-        let max_bytes = if BUDGETED {
-            budget.max_bytes.max(1)
+        let max_bytes = if let Some(b) = budget.filter(|_| BUDGETED) {
+            b.max_bytes.max(1)
         } else {
             usize::MAX
         };
@@ -924,7 +924,7 @@ impl ArrowDecoder {
                 }
             }
 
-            if BUDGETED {
+            if let Some(budget) = budget.filter(|_| BUDGETED) {
                 entries += 1;
                 let bytes_consumed = parser.pos().saturating_sub(start_pos);
                 let duration_exceeded = (budget.max_duration.is_zero()
@@ -1679,11 +1679,10 @@ impl Iterator for DecodeStream<'_, '_> {
             self.cursor.done = true;
             return Some(Err(err));
         }
-        match self.decoder.step_cursor::<false>(
-            &mut self.cursor,
-            self.input,
-            DecodeBudget::default_budget(),
-        ) {
+        match self
+            .decoder
+            .step_cursor::<false>(&mut self.cursor, self.input, None)
+        {
             Ok(DecodeStep::Batch(batch)) => Some(Ok(batch)),
             Ok(DecodeStep::Done) => None,
             Ok(DecodeStep::Pending) => {
