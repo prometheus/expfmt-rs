@@ -516,6 +516,15 @@ impl ArrowDecoder {
         input: &[u8],
         budget: DecodeBudget,
     ) -> Result<DecodeStep, DecodeError> {
+        self.step_cursor::<true>(cursor, input, budget)
+    }
+
+    fn step_cursor<const BUDGETED: bool>(
+        &mut self,
+        cursor: &mut DecodeCursor,
+        input: &[u8],
+        budget: DecodeBudget,
+    ) -> Result<DecodeStep, DecodeError> {
         if cursor.done {
             return Ok(DecodeStep::Done);
         }
@@ -536,7 +545,7 @@ impl ArrowDecoder {
         let state = std::mem::replace(&mut cursor.parser_state, ActiveParserState::Invalid);
         let mut parser = state.into_parser(input);
         let res = if cursor.chunked {
-            self.ingest_entries::<true, true>(
+            self.ingest_entries::<true, BUDGETED>(
                 &mut parser,
                 &cursor.opts,
                 cursor.default_ts_ns,
@@ -546,7 +555,7 @@ impl ArrowDecoder {
                 &mut cursor.done,
             )
         } else {
-            self.ingest_entries::<false, true>(
+            self.ingest_entries::<false, BUDGETED>(
                 &mut parser,
                 &cursor.opts,
                 cursor.default_ts_ns,
@@ -602,32 +611,39 @@ impl ArrowDecoder {
         format: &Format,
         opts: &DecodeOptions,
     ) -> DecodeStream<'dec, 'input> {
-        self.reset_scrape();
-        let max_data_points = opts
-            .max_data_points_per_batch
-            .clamp(1, (u32::MAX as usize).saturating_add(1));
-
-        match self.init_scrape_parser(input, format, opts) {
-            Ok((parser, default_ts_ns)) => DecodeStream {
-                decoder: self,
-                parser,
-                opts: *opts,
-                default_ts_ns,
-                max_data_points,
-                pending_series: false,
-                init_err: None,
-                done: false,
-            },
-            Err(err) => DecodeStream {
-                decoder: self,
-                parser: ActiveParser::Invalid,
-                opts: *opts,
-                default_ts_ns: None,
-                max_data_points,
-                pending_series: false,
-                init_err: Some(err),
-                done: false,
-            },
+        match self.start_decode_stream(format, opts) {
+            Ok(mut cursor) => {
+                cursor.input_len = Some(input.len());
+                DecodeStream {
+                    decoder: self,
+                    input,
+                    cursor,
+                    init_err: None,
+                }
+            }
+            Err(err) => {
+                let max_data_points = opts
+                    .max_data_points_per_batch
+                    .clamp(1, (u32::MAX as usize).saturating_add(1));
+                let scrape_id = self.scrape_id;
+                DecodeStream {
+                    decoder: self,
+                    input,
+                    cursor: DecodeCursor {
+                        parser_state: ActiveParserState::Invalid,
+                        opts: *opts,
+                        default_ts_ns: None,
+                        max_data_points,
+                        scrape_id,
+                        input_len: Some(input.len()),
+                        pos: 0,
+                        chunked: true,
+                        pending_series: false,
+                        done: false,
+                    },
+                    init_err: Some(err),
+                }
+            }
         }
     }
 
@@ -1576,22 +1592,18 @@ impl ArrowDecoder {
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct DecodeStream<'dec, 'input> {
     decoder: &'dec mut ArrowDecoder,
-    parser: ActiveParser<'input>,
-    opts: DecodeOptions,
-    default_ts_ns: Option<i64>,
-    max_data_points: usize,
-    pending_series: bool,
+    input: &'input [u8],
+    cursor: DecodeCursor,
     init_err: Option<DecodeError>,
-    done: bool,
 }
 
 impl std::fmt::Debug for DecodeStream<'_, '_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecodeStream")
-            .field("opts", &self.opts)
+            .field("opts", &self.cursor.opts)
             .field("pos", &self.pos())
-            .field("pending_series", &self.pending_series)
-            .field("done", &self.done)
+            .field("pending_series", &self.cursor.pending_series)
+            .field("done", &self.cursor.done)
             .finish_non_exhaustive()
     }
 }
@@ -1599,8 +1611,8 @@ impl std::fmt::Debug for DecodeStream<'_, '_> {
 impl DecodeStream<'_, '_> {
     /// Returns the current byte offset of the parser cursor in `input` (`0..=input.len()`).
     #[must_use]
-    pub fn pos(&self) -> usize {
-        self.parser.pos()
+    pub const fn pos(&self) -> usize {
+        self.cursor.pos()
     }
 
     /// Advances parsing and metric family assembly until a chunk is ready
@@ -1614,29 +1626,15 @@ impl DecodeStream<'_, '_> {
     /// family, duplicate label names appear on a sample, or an OTAP table exceeds its integer ID
     /// width.
     pub fn step(&mut self, budget: DecodeBudget) -> Result<DecodeStep, DecodeError> {
-        if self.done {
+        if self.cursor.done {
             return Ok(DecodeStep::Done);
         }
         if let Some(err) = self.init_err.take() {
-            self.done = true;
+            self.cursor.done = true;
             return Err(err);
         }
-        match self.decoder.ingest_entries::<true, true>(
-            &mut self.parser,
-            &self.opts,
-            self.default_ts_ns,
-            self.max_data_points,
-            budget,
-            &mut self.pending_series,
-            &mut self.done,
-        ) {
-            Ok(step) => Ok(step),
-            Err(err) => {
-                self.done = true;
-                self.decoder.reset_scrape();
-                Err(err)
-            }
-        }
+        self.decoder
+            .step_decode(&mut self.cursor, self.input, budget)
     }
 
     /// Cooperatively pulls the next non-empty [`OtapMetricRecords`] chunk from the stream,
@@ -1661,29 +1659,21 @@ impl Iterator for DecodeStream<'_, '_> {
     type Item = Result<OtapMetricRecords, DecodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
+        if self.cursor.done {
             return None;
         }
         if let Some(err) = self.init_err.take() {
-            self.done = true;
+            self.cursor.done = true;
             return Some(Err(err));
         }
-        match self.decoder.ingest_entries::<true, false>(
-            &mut self.parser,
-            &self.opts,
-            self.default_ts_ns,
-            self.max_data_points,
+        match self.decoder.step_cursor::<false>(
+            &mut self.cursor,
+            self.input,
             DecodeBudget::default_budget(),
-            &mut self.pending_series,
-            &mut self.done,
         ) {
             Ok(DecodeStep::Batch(batch)) => Some(Ok(batch)),
             Ok(DecodeStep::Done | DecodeStep::Pending) => None,
-            Err(err) => {
-                self.done = true;
-                self.decoder.reset_scrape();
-                Some(Err(err))
-            }
+            Err(err) => Some(Err(err)),
         }
     }
 }
@@ -1692,6 +1682,6 @@ impl FusedIterator for DecodeStream<'_, '_> {}
 
 impl Drop for DecodeStream<'_, '_> {
     fn drop(&mut self) {
-        self.parser.take_scratch_into(self.decoder);
+        self.decoder.finish_decode(&mut self.cursor);
     }
 }
