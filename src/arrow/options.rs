@@ -39,10 +39,14 @@ pub const DEFAULT_DECODE_BUDGET_MAX_DURATION: Duration = Duration::from_millis(1
 /// budgeted decode steps.
 pub const DECODE_BUDGET_DURATION_CHECK_INTERVAL: usize = 16;
 
-/// Cooperative step budget bounding how much work [`super::DecodeStream::step`],
+/// Cooperative step budget bounding how much entry ingestion work [`super::DecodeStream::step`],
 /// [`super::ArrowDecoder::step_decode`], [`super::ArrowDecoder::decode_cooperative`], and
 /// [`super::DecodeStream::next_cooperative`] perform before yielding back to the caller's event
 /// loop.
+///
+/// Batch construction at a chunk boundary or end-of-input runs synchronously at the end of the
+/// step; use [`super::ArrowDecoder::start_decode_stream`] or
+/// [`super::ArrowDecoder::decode_stream`] to bound per-batch finalization size on large scrapes.
 ///
 /// Defaults match `otel-arrow`'s `DecodeBudget::default()` (`max_entries = 128`,
 /// `max_bytes = 64 KiB`, `max_duration = 1ms`). Values of `0` for `max_entries` or `max_bytes`

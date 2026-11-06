@@ -438,7 +438,11 @@ impl ArrowDecoder {
     /// exhausted at an `Entry` boundary.
     ///
     /// When the entire scrape fits within the first `budget` step, this method completes on the
-    /// first poll without invoking `yield_to_runtime`.
+    /// first poll without invoking `yield_to_runtime`. Because single-batch mode materializes all
+    /// Arrow `RecordBatch`es for the scrape in the final step once end-of-input is reached, use
+    /// [`ArrowDecoder::decode_stream`] with [`DecodeStream::next_cooperative`] or
+    /// [`ArrowDecoder::start_decode_stream`] on large scrapes to bound per-batch finalization by
+    /// [`DecodeOptions::max_data_points_per_batch`].
     ///
     /// # Errors
     ///
@@ -480,6 +484,11 @@ impl ArrowDecoder {
 
     /// Initializes a lifetime-free [`DecodeCursor`] for single-batch cooperative decoding with
     /// [`ArrowDecoder::step_decode`].
+    ///
+    /// Single-batch mode stages the entire scrape and materializes all Arrow `RecordBatch`es in
+    /// the final step when end-of-input is reached. For large scrapes, prefer
+    /// [`ArrowDecoder::start_decode_stream`] so batch finalization stays bounded by
+    /// [`DecodeOptions::max_data_points_per_batch`].
     ///
     /// # Errors
     ///
