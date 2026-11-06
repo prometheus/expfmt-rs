@@ -272,8 +272,18 @@ impl<'input> ActiveParser<'input> {
 
     fn take_scratch_into(&mut self, decoder: &mut ArrowDecoder) {
         match self {
-            Self::Prom(p) => decoder.prom_spans = p.take_scratch(),
-            Self::OpenMetrics(p) => decoder.om_scratch = p.take_scratch(),
+            Self::Prom(p) => {
+                let scratch = p.take_scratch();
+                if scratch.capacity() > decoder.prom_spans.capacity() {
+                    decoder.prom_spans = scratch;
+                }
+            }
+            Self::OpenMetrics(p) => {
+                let scratch = p.take_scratch();
+                if scratch.retained_memory_bytes() > decoder.om_scratch.retained_memory_bytes() {
+                    decoder.om_scratch = scratch;
+                }
+            }
             Self::Invalid => {}
         }
     }
