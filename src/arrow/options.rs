@@ -245,6 +245,11 @@ pub enum DecodeError {
     #[error("unsupported exposition format: {0}")]
     UnsupportedFormat(String),
 
+    /// A [`super::DecodeCursor`] from an earlier or different decoder scrape was passed to
+    /// [`super::ArrowDecoder::step_decode`], or the input slice changed between steps.
+    #[error("invalid decode cursor: {0}")]
+    InvalidCursor(&'static str),
+
     /// Unexpected token while lexing or parsing the exposition grammar.
     #[error("{expected} at byte {offset}")]
     Syntax {

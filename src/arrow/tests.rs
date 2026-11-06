@@ -945,7 +945,7 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
     assert!(matches!(
         job.decoder
             .step_decode(&mut trunc_cursor, &bad_bytes[trunc_pos..], budget),
-        Err(DecodeError::Syntax { .. })
+        Err(DecodeError::InvalidCursor(_))
     ));
     assert!(trunc_cursor.is_done());
 
@@ -956,7 +956,7 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
         .unwrap();
     assert!(matches!(
         job.decoder.step_decode(&mut stale_cursor, b"m 1\n", budget),
-        Err(DecodeError::Syntax { .. })
+        Err(DecodeError::InvalidCursor(_))
     ));
     assert!(stale_cursor.is_done());
 
@@ -966,7 +966,7 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
     let _ = dec_b.start_decode(&Format::TEXT, &opts).unwrap();
     assert!(matches!(
         dec_b.step_decode(&mut cursor_from_a, b"y 3\n", budget),
-        Err(DecodeError::Syntax { .. })
+        Err(DecodeError::InvalidCursor(_))
     ));
     assert!(cursor_from_a.is_done());
 }

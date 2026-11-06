@@ -526,18 +526,16 @@ impl ArrowDecoder {
         if cursor.scrape_id != self.scrape_id {
             cursor.done = true;
             cursor.parser_state.take_scratch_into(self);
-            return Err(DecodeError::Syntax {
-                expected: "active decode cursor for current decoder scrape",
-                offset: cursor.pos,
-            });
+            return Err(DecodeError::InvalidCursor(
+                "cursor does not belong to current decoder scrape",
+            ));
         }
         let expected_len = *cursor.input_len.get_or_insert(input.len());
         if input.len() != expected_len {
             self.finish_decode(cursor);
-            return Err(DecodeError::Syntax {
-                expected: "unchanged scrape input buffer across decode steps",
-                offset: cursor.pos,
-            });
+            return Err(DecodeError::InvalidCursor(
+                "scrape input buffer length changed across decode steps",
+            ));
         }
         let state = std::mem::replace(&mut cursor.parser_state, ActiveParserState::Invalid);
         let mut parser = state.into_parser(input);
