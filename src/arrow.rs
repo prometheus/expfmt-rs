@@ -28,12 +28,16 @@ mod schema;
 #[cfg(test)]
 mod tests;
 
+use std::future::Future;
 use std::iter::FusedIterator;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use crate::format::{Format, FormatType};
 use crate::parse::{
-    Entry, LabelSpan, METRIC_NAME_LABEL, MetricType, OmScratch, OpenMetricsParser, ParseError,
-    Parser, PromParser, parse_go_float, unescape_bytes_into,
+    Entry, LabelSpan, METRIC_NAME_LABEL, MetricType, OmScratch, OpenMetricsParser,
+    OpenMetricsParserState, ParseError, Parser, PromParser, PromParserState, parse_go_float,
+    unescape_bytes_into,
 };
 
 use self::columns::{
@@ -43,8 +47,10 @@ use self::columns::{
 use self::family::{CurrentFamily, FamilyAssembly, SeriesRole};
 use self::intern::StringInterner;
 pub use self::options::{
-    CounterSuffixPolicy, DEFAULT_MAX_DATA_POINTS_PER_BATCH, DecodeError, DecodeOptions,
-    UnitSuffixPolicy, UntypedPolicy,
+    CounterSuffixPolicy, DECODE_BUDGET_DURATION_CHECK_INTERVAL, DEFAULT_DECODE_BUDGET_MAX_BYTES,
+    DEFAULT_DECODE_BUDGET_MAX_DURATION, DEFAULT_DECODE_BUDGET_MAX_ENTRIES,
+    DEFAULT_MAX_DATA_POINTS_PER_BATCH, DecodeBudget, DecodeError, DecodeOptions, UnitSuffixPolicy,
+    UntypedPolicy,
 };
 pub use self::records::{MetricPayloadType, OtapMetricRecords};
 pub use self::schema::PROMETHEUS_TYPE_METADATA_KEY;
@@ -52,7 +58,118 @@ pub use self::schema::PROMETHEUS_TYPE_METADATA_KEY;
 /// Maximum distinct `UnivariateMetrics` rows representable in a single OTAP batch (`u16` IDs).
 const MAX_METRICS_PER_BATCH: usize = (u16::MAX as usize) + 1;
 
+/// Process-wide counter assigning each decoder scrape a unique ID so a [`DecodeCursor`] from one
+/// [`ArrowDecoder`] cannot pass the active-scrape check on another [`ArrowDecoder`].
+static NEXT_SCRAPE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_scrape_id() -> u64 {
+    NEXT_SCRAPE_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 type SpanAndTraceId = (Option<[u8; 8]>, Option<[u8; 16]>);
+
+/// Outcome of a single bounded decode step in [`DecodeStream::step`] or
+/// [`ArrowDecoder::step_decode`].
+#[derive(Clone, Debug, PartialEq)]
+// Keep `OtapMetricRecords` unboxed on the stack just like `Option<Result<OtapMetricRecords, _>>`
+// in `DecodeStream::next` so finalizing a batch does not add an extra heap allocation.
+#[allow(clippy::large_enum_variant)]
+pub enum DecodeStep {
+    /// The [`DecodeBudget`] was reached at an `Entry` boundary before a batch boundary or
+    /// end-of-input; yield to the runtime and call `step` again.
+    Pending,
+    /// A [`OtapMetricRecords`] batch was finalized. Call `step` again until [`DecodeStep::Done`]
+    /// is returned.
+    Batch(OtapMetricRecords),
+    /// End of input was reached with no remaining data points.
+    Done,
+}
+
+enum ActiveParserState {
+    Prom(PromParserState),
+    OpenMetrics(OpenMetricsParserState),
+    Invalid,
+}
+
+impl ActiveParserState {
+    #[inline]
+    fn into_parser(self, input: &[u8]) -> ActiveParser<'_> {
+        match self {
+            Self::Prom(state) => ActiveParser::Prom(PromParser::from_state(input, state)),
+            Self::OpenMetrics(state) => {
+                ActiveParser::OpenMetrics(OpenMetricsParser::from_state(input, state))
+            }
+            Self::Invalid => ActiveParser::Invalid,
+        }
+    }
+
+    fn take_scratch_into(&mut self, decoder: &mut ArrowDecoder) {
+        match std::mem::replace(self, Self::Invalid) {
+            Self::Prom(mut state) => {
+                let scratch = state.take_scratch();
+                if scratch.capacity() > decoder.prom_spans.capacity() {
+                    decoder.prom_spans = scratch;
+                }
+            }
+            Self::OpenMetrics(mut state) => {
+                let scratch = state.take_scratch();
+                if scratch.retained_memory_bytes() > decoder.om_scratch.retained_memory_bytes() {
+                    decoder.om_scratch = scratch;
+                }
+            }
+            Self::Invalid => {}
+        }
+    }
+}
+
+/// Lifetime-free incremental decode cursor for driving [`ArrowDecoder::step_decode`] across
+/// async suspension points without borrowing the input slice.
+///
+/// Created by [`ArrowDecoder::start_decode`] (single-batch mode) or
+/// [`ArrowDecoder::start_decode_stream`] (chunked streaming mode). Because `DecodeCursor` stores
+/// only byte-offset spans and parser state rather than references into the scrape payload, an
+/// owned task or `otel-arrow` `PdataDecodeJob` struct can hold an owned buffer (`Bytes`,
+/// `Vec<u8>`, or `Rc<[u8]>`), an [`ArrowDecoder`], and a `DecodeCursor` side by side under
+/// `#![forbid(unsafe_code)]`.
+pub struct DecodeCursor {
+    parser_state: ActiveParserState,
+    opts: DecodeOptions,
+    default_ts_ns: Option<i64>,
+    max_data_points: usize,
+    scrape_id: u64,
+    input_len: Option<usize>,
+    pos: usize,
+    chunked: bool,
+    pending_series: bool,
+    done: bool,
+}
+
+impl std::fmt::Debug for DecodeCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeCursor")
+            .field("opts", &self.opts)
+            .field("pos", &self.pos)
+            .field("chunked", &self.chunked)
+            .field("pending_series", &self.pending_series)
+            .field("done", &self.done)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecodeCursor {
+    /// Returns the current byte offset of the parser cursor in `input` (`0..=input.len()`).
+    #[must_use]
+    pub const fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Returns `true` once the cursor has reached end-of-input or encountered an error.
+    #[must_use]
+    pub const fn is_done(&self) -> bool {
+        self.done
+    }
+}
 
 enum ActiveParser<'input> {
     Prom(PromParser<'input>),
@@ -64,6 +181,24 @@ impl<'input> ActiveParser<'input> {
     #[inline]
     fn is_openmetrics(&self) -> bool {
         matches!(self, Self::OpenMetrics(_))
+    }
+
+    #[inline]
+    fn pos(&self) -> usize {
+        match self {
+            Self::Prom(p) => p.pos(),
+            Self::OpenMetrics(p) => p.pos(),
+            Self::Invalid => 0,
+        }
+    }
+
+    #[inline]
+    fn into_state(self) -> ActiveParserState {
+        match self {
+            Self::Prom(p) => ActiveParserState::Prom(p.into_state()),
+            Self::OpenMetrics(p) => ActiveParserState::OpenMetrics(p.into_state()),
+            Self::Invalid => ActiveParserState::Invalid,
+        }
     }
 
     #[inline]
@@ -138,8 +273,18 @@ impl<'input> ActiveParser<'input> {
 
     fn take_scratch_into(&mut self, decoder: &mut ArrowDecoder) {
         match self {
-            Self::Prom(p) => decoder.prom_spans = p.take_scratch(),
-            Self::OpenMetrics(p) => decoder.om_scratch = p.take_scratch(),
+            Self::Prom(p) => {
+                let scratch = p.take_scratch();
+                if scratch.capacity() > decoder.prom_spans.capacity() {
+                    decoder.prom_spans = scratch;
+                }
+            }
+            Self::OpenMetrics(p) => {
+                let scratch = p.take_scratch();
+                if scratch.retained_memory_bytes() > decoder.om_scratch.retained_memory_bytes() {
+                    decoder.om_scratch = scratch;
+                }
+            }
             Self::Invalid => {}
         }
     }
@@ -152,6 +297,7 @@ impl<'input> ActiveParser<'input> {
 /// string interners, and column staging buffers so steady-state scrapes allocate only the output
 /// Arrow `Buffer`s returned inside [`OtapMetricRecords`].
 pub struct ArrowDecoder {
+    scrape_id: u64,
     prom_spans: Vec<LabelSpan>,
     om_scratch: OmScratch,
     unescape_buf: Vec<u8>,
@@ -175,6 +321,14 @@ impl Default for ArrowDecoder {
     }
 }
 
+impl std::fmt::Debug for ArrowDecoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ArrowDecoder")
+            .field("retained_memory_bytes", &self.retained_memory_bytes())
+            .finish_non_exhaustive()
+    }
+}
+
 impl ArrowDecoder {
     /// Creates a new [`ArrowDecoder`] with default initial buffer capacities.
     #[must_use]
@@ -187,6 +341,7 @@ impl ArrowDecoder {
     #[must_use]
     pub fn with_capacity(metrics: usize, data_points: usize, attrs: usize) -> Self {
         Self {
+            scrape_id: 0,
             prom_spans: Vec::with_capacity(16),
             om_scratch: OmScratch::default(),
             unescape_buf: Vec::new(),
@@ -230,8 +385,8 @@ impl ArrowDecoder {
     ///
     /// # Contiguous families and batching
     ///
-    /// Input parsing streams `Entry` items one by one from [`PromParser`] or
-    /// [`OpenMetricsParser`] directly into reusable columnar staging vectors and label string
+    /// Input parsing streams `Entry` items one by one from `PromParser` or
+    /// `OpenMetricsParser` directly into reusable columnar staging vectors and label string
     /// interners without materializing intermediate per-sample structs or per-string allocations.
     /// Metric families are decoded as contiguous runs, with `# HELP`, `# TYPE`, and `# UNIT`
     /// lines appearing before that family's samples. Non-contiguous repetitions of an earlier
@@ -259,16 +414,209 @@ impl ArrowDecoder {
 
         let mut pending_series = false;
         let mut done = false;
-        let res = self.ingest_entries::<false>(
+        let res = self.ingest_entries::<false, false>(
             &mut parser,
             opts,
             default_ts_ns,
             0,
+            None,
             &mut pending_series,
             &mut done,
         );
         parser.take_scratch_into(self);
-        Ok(res?.unwrap_or_default())
+        match res? {
+            DecodeStep::Batch(records) => Ok(records),
+            DecodeStep::Done => Ok(OtapMetricRecords::default()),
+            DecodeStep::Pending => {
+                unreachable!("unbudgeted decode never returns DecodeStep::Pending")
+            }
+        }
+    }
+
+    /// Cooperatively decodes a single exposition scrape buffer of `format` into OTAP metric
+    /// [`arrow_array::RecordBatch`]es, yielding via `yield_to_runtime` whenever `budget` is
+    /// exhausted at an `Entry` boundary.
+    ///
+    /// When the entire scrape fits within the first `budget` step, this method completes on the
+    /// first poll without invoking `yield_to_runtime`. Because single-batch mode materializes all
+    /// Arrow `RecordBatch`es for the scrape in the final step once end-of-input is reached, use
+    /// [`ArrowDecoder::decode_stream`] with [`DecodeStream::next_cooperative`] or
+    /// [`ArrowDecoder::start_decode_stream`] on large scrapes to bound per-batch finalization by
+    /// [`DecodeOptions::max_data_points_per_batch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] under the same conditions as [`ArrowDecoder::decode`].
+    pub async fn decode_cooperative<Y: Future<Output = ()>>(
+        &mut self,
+        input: &[u8],
+        format: &Format,
+        opts: &DecodeOptions,
+        budget: DecodeBudget,
+        mut yield_to_runtime: impl FnMut() -> Y,
+    ) -> Result<OtapMetricRecords, DecodeError> {
+        struct CursorDropGuard<'dec> {
+            decoder: &'dec mut ArrowDecoder,
+            cursor: DecodeCursor,
+        }
+        impl Drop for CursorDropGuard<'_> {
+            fn drop(&mut self) {
+                self.decoder.finish_decode(&mut self.cursor);
+            }
+        }
+
+        let cursor = self.start_decode(format, opts)?;
+        let mut guard = CursorDropGuard {
+            decoder: self,
+            cursor,
+        };
+        loop {
+            match guard
+                .decoder
+                .step_decode(&mut guard.cursor, input, budget)?
+            {
+                DecodeStep::Pending => yield_to_runtime().await,
+                DecodeStep::Batch(records) => return Ok(records),
+                DecodeStep::Done => return Ok(OtapMetricRecords::default()),
+            }
+        }
+    }
+
+    /// Initializes a lifetime-free [`DecodeCursor`] for single-batch cooperative decoding with
+    /// [`ArrowDecoder::step_decode`].
+    ///
+    /// Single-batch mode stages the entire scrape and materializes all Arrow `RecordBatch`es in
+    /// the final step when end-of-input is reached. For large scrapes, prefer
+    /// [`ArrowDecoder::start_decode_stream`] so batch finalization stays bounded by
+    /// [`DecodeOptions::max_data_points_per_batch`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if `format` is unsupported or `opts.timestamp_ms` overflows `i64`
+    /// nanoseconds.
+    pub fn start_decode(
+        &mut self,
+        format: &Format,
+        opts: &DecodeOptions,
+    ) -> Result<DecodeCursor, DecodeError> {
+        self.init_cursor(format, opts, false)
+    }
+
+    /// Initializes a lifetime-free [`DecodeCursor`] for chunked streaming cooperative decoding
+    /// with [`ArrowDecoder::step_decode`], bounded by [`DecodeOptions::max_data_points_per_batch`]
+    /// and OTAP's 65,536-metric per-batch `u16` ID limit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if `format` is unsupported or `opts.timestamp_ms` overflows `i64`
+    /// nanoseconds.
+    pub fn start_decode_stream(
+        &mut self,
+        format: &Format,
+        opts: &DecodeOptions,
+    ) -> Result<DecodeCursor, DecodeError> {
+        self.init_cursor(format, opts, true)
+    }
+
+    /// Advances `cursor` over `input` by at most `budget` entries, bytes, or duration, pausing at
+    /// `Entry` boundaries.
+    ///
+    /// Callers must pass the exact same `input` byte slice (both contents and length) to every
+    /// `step_decode` call for a given `cursor`, because the cursor and staged parser state store
+    /// byte offsets into `input`.
+    ///
+    /// Internal parser scratch buffers are automatically returned to `self` once `cursor` reaches
+    /// end-of-input or encounters an error. If `cursor` is abandoned early before completion,
+    /// call [`ArrowDecoder::finish_decode`] to reclaim its parser scratch buffers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if the exposition payload fails validation or an OTAP table exceeds
+    /// its integer ID width.
+    pub fn step_decode(
+        &mut self,
+        cursor: &mut DecodeCursor,
+        input: &[u8],
+        budget: DecodeBudget,
+    ) -> Result<DecodeStep, DecodeError> {
+        self.step_cursor::<true>(cursor, input, Some(budget))
+    }
+
+    fn step_cursor<const BUDGETED: bool>(
+        &mut self,
+        cursor: &mut DecodeCursor,
+        input: &[u8],
+        budget: Option<DecodeBudget>,
+    ) -> Result<DecodeStep, DecodeError> {
+        if cursor.done {
+            return Ok(DecodeStep::Done);
+        }
+        if cursor.scrape_id != self.scrape_id {
+            cursor.done = true;
+            cursor.parser_state.take_scratch_into(self);
+            return Err(DecodeError::InvalidCursor(
+                "cursor does not belong to current decoder scrape",
+            ));
+        }
+        let expected_len = *cursor.input_len.get_or_insert(input.len());
+        if input.len() != expected_len {
+            self.finish_decode(cursor);
+            return Err(DecodeError::InvalidCursor(
+                "scrape input buffer length changed across decode steps",
+            ));
+        }
+        let state = std::mem::replace(&mut cursor.parser_state, ActiveParserState::Invalid);
+        let mut parser = state.into_parser(input);
+        let res = if cursor.chunked {
+            self.ingest_entries::<true, BUDGETED>(
+                &mut parser,
+                &cursor.opts,
+                cursor.default_ts_ns,
+                cursor.max_data_points,
+                budget,
+                &mut cursor.pending_series,
+                &mut cursor.done,
+            )
+        } else {
+            self.ingest_entries::<false, BUDGETED>(
+                &mut parser,
+                &cursor.opts,
+                cursor.default_ts_ns,
+                0,
+                budget,
+                &mut cursor.pending_series,
+                &mut cursor.done,
+            )
+        };
+        cursor.pos = parser.pos();
+        match res {
+            Ok(step) => {
+                if cursor.done {
+                    parser.take_scratch_into(self);
+                } else {
+                    cursor.parser_state = parser.into_state();
+                }
+                Ok(step)
+            }
+            Err(err) => {
+                cursor.done = true;
+                parser.take_scratch_into(self);
+                self.reset_scrape();
+                Err(err)
+            }
+        }
+    }
+
+    /// Ends an active [`DecodeCursor`] and reclaims its internal parser scratch buffers into
+    /// `self`.
+    pub fn finish_decode(&mut self, cursor: &mut DecodeCursor) {
+        cursor.parser_state.take_scratch_into(self);
+        if !cursor.done {
+            cursor.done = true;
+            if cursor.scrape_id == self.scrape_id {
+                self.reset_scrape();
+            }
+        }
     }
 
     /// Streams `input` as a sequence of non-empty [`OtapMetricRecords`] chunks bounded by
@@ -286,33 +634,68 @@ impl ArrowDecoder {
         format: &Format,
         opts: &DecodeOptions,
     ) -> DecodeStream<'dec, 'input> {
-        self.reset_scrape();
-        let max_data_points = opts
-            .max_data_points_per_batch
-            .clamp(1, (u32::MAX as usize).saturating_add(1));
-
-        match self.init_scrape_parser(input, format, opts) {
-            Ok((parser, default_ts_ns)) => DecodeStream {
-                decoder: self,
-                parser,
-                opts: *opts,
-                default_ts_ns,
-                max_data_points,
-                pending_series: false,
-                init_err: None,
-                done: false,
-            },
-            Err(err) => DecodeStream {
-                decoder: self,
-                parser: ActiveParser::Invalid,
-                opts: *opts,
-                default_ts_ns: None,
-                max_data_points,
-                pending_series: false,
-                init_err: Some(err),
-                done: false,
-            },
+        match self.start_decode_stream(format, opts) {
+            Ok(mut cursor) => {
+                cursor.input_len = Some(input.len());
+                DecodeStream {
+                    decoder: self,
+                    input,
+                    cursor,
+                    init_err: None,
+                }
+            }
+            Err(err) => {
+                let max_data_points = opts
+                    .max_data_points_per_batch
+                    .clamp(1, (u32::MAX as usize).saturating_add(1));
+                let scrape_id = self.scrape_id;
+                DecodeStream {
+                    decoder: self,
+                    input,
+                    cursor: DecodeCursor {
+                        parser_state: ActiveParserState::Invalid,
+                        opts: *opts,
+                        default_ts_ns: None,
+                        max_data_points,
+                        scrape_id,
+                        input_len: Some(input.len()),
+                        pos: 0,
+                        chunked: true,
+                        pending_series: false,
+                        done: false,
+                    },
+                    init_err: Some(err),
+                }
+            }
         }
+    }
+
+    fn init_cursor(
+        &mut self,
+        format: &Format,
+        opts: &DecodeOptions,
+        chunked: bool,
+    ) -> Result<DecodeCursor, DecodeError> {
+        self.reset_scrape();
+        let max_data_points = if chunked {
+            opts.max_data_points_per_batch
+                .clamp(1, (u32::MAX as usize).saturating_add(1))
+        } else {
+            0
+        };
+        let (parser, default_ts_ns) = self.init_scrape_parser(b"", format, opts)?;
+        Ok(DecodeCursor {
+            parser_state: parser.into_state(),
+            opts: *opts,
+            default_ts_ns,
+            max_data_points,
+            scrape_id: self.scrape_id,
+            input_len: None,
+            pos: 0,
+            chunked,
+            pending_series: false,
+            done: false,
+        })
     }
 
     fn init_scrape_parser<'input>(
@@ -344,6 +727,7 @@ impl ArrowDecoder {
     }
 
     fn reset_scrape(&mut self) {
+        self.scrape_id = next_scrape_id();
         self.current_family.clear();
         self.assembly.clear();
         self.reset_batch();
@@ -417,18 +801,36 @@ impl ArrowDecoder {
         Ok(())
     }
 
-    // Monomorphizing on `CHUNKED` shares one entry dispatch loop between `decode` (`false`) and
-    // `decode_stream` (`true`) while compiling out chunk-boundary flush checks on single-batch
-    // calls.
-    fn ingest_entries<const CHUNKED: bool>(
+    // Monomorphizing on `CHUNKED` and `BUDGETED` shares one entry dispatch loop across
+    // synchronous single-batch `decode` (`false, false`), synchronous `decode_stream`
+    // (`true, false`), cooperative single-batch `decode_cooperative` (`false, true`), and
+    // cooperative streaming `DecodeStream::step` (`true, true`), compiling out unused checks on
+    // each path.
+    #[allow(clippy::too_many_arguments)]
+    fn ingest_entries<const CHUNKED: bool, const BUDGETED: bool>(
         &mut self,
         parser: &mut ActiveParser<'_>,
         opts: &DecodeOptions,
         default_ts_ns: Option<i64>,
         max_data_points: usize,
+        budget: Option<DecodeBudget>,
         pending_series: &mut bool,
         done: &mut bool,
-    ) -> Result<Option<OtapMetricRecords>, DecodeError> {
+    ) -> Result<DecodeStep, DecodeError> {
+        let start_pos = if BUDGETED { parser.pos() } else { 0 };
+        let max_entries = if let Some(b) = budget.filter(|_| BUDGETED) {
+            b.max_entries.max(1)
+        } else {
+            usize::MAX
+        };
+        let max_bytes = if let Some(b) = budget.filter(|_| BUDGETED) {
+            b.max_bytes.max(1)
+        } else {
+            usize::MAX
+        };
+        let started = if BUDGETED { Some(Instant::now()) } else { None };
+        let mut entries = 0usize;
+
         loop {
             let entry = if CHUNKED && *pending_series {
                 *pending_series = false;
@@ -439,15 +841,14 @@ impl ArrowDecoder {
                     None => {
                         self.flush_pending_family(opts, default_ts_ns)?;
                         *done = true;
-                        if CHUNKED {
-                            if self.metrics.is_empty() {
-                                return Ok(None);
-                            }
-                            let batch = self.finish_batches(default_ts_ns.is_some())?;
-                            self.reset_batch();
-                            return Ok(Some(batch));
+                        if self.metrics.is_empty() {
+                            return Ok(DecodeStep::Done);
                         }
-                        return Ok(Some(self.finish_batches(default_ts_ns.is_some())?));
+                        let batch = self.finish_batches(default_ts_ns.is_some())?;
+                        if CHUNKED {
+                            self.reset_batch();
+                        }
+                        return Ok(DecodeStep::Batch(batch));
                     }
                 }
             };
@@ -493,7 +894,7 @@ impl ArrowDecoder {
                                 *pending_series = true;
                                 let batch = self.finish_batches(default_ts_ns.is_some())?;
                                 self.reset_batch();
-                                return Ok(Some(batch));
+                                return Ok(DecodeStep::Batch(batch));
                             }
                             self.current_family
                                 .start_new(raw_name, &self.series_name_buf);
@@ -516,7 +917,7 @@ impl ArrowDecoder {
                             *pending_series = true;
                             let batch = self.finish_batches(default_ts_ns.is_some())?;
                             self.reset_batch();
-                            return Ok(Some(batch));
+                            return Ok(DecodeStep::Batch(batch));
                         }
                     }
 
@@ -528,8 +929,19 @@ impl ArrowDecoder {
                     {
                         let batch = self.finish_batches(default_ts_ns.is_some())?;
                         self.reset_batch();
-                        return Ok(Some(batch));
+                        return Ok(DecodeStep::Batch(batch));
                     }
+                }
+            }
+
+            if let Some(budget) = budget.filter(|_| BUDGETED) {
+                entries += 1;
+                let bytes_consumed = parser.pos().saturating_sub(start_pos);
+                let duration_exceeded = (budget.max_duration.is_zero()
+                    || entries.is_multiple_of(DECODE_BUDGET_DURATION_CHECK_INTERVAL))
+                    && started.is_some_and(|t| t.elapsed() >= budget.max_duration);
+                if entries >= max_entries || bytes_consumed >= max_bytes || duration_exceeded {
+                    return Ok(DecodeStep::Pending);
                 }
             }
         }
@@ -1203,41 +1615,90 @@ impl ArrowDecoder {
 #[must_use = "iterators are lazy and do nothing unless consumed"]
 pub struct DecodeStream<'dec, 'input> {
     decoder: &'dec mut ArrowDecoder,
-    parser: ActiveParser<'input>,
-    opts: DecodeOptions,
-    default_ts_ns: Option<i64>,
-    max_data_points: usize,
-    pending_series: bool,
+    input: &'input [u8],
+    cursor: DecodeCursor,
     init_err: Option<DecodeError>,
-    done: bool,
+}
+
+impl std::fmt::Debug for DecodeStream<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecodeStream")
+            .field("opts", &self.cursor.opts)
+            .field("pos", &self.pos())
+            .field("pending_series", &self.cursor.pending_series)
+            .field("done", &self.cursor.done)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DecodeStream<'_, '_> {
+    /// Returns the current byte offset of the parser cursor in `input` (`0..=input.len()`).
+    #[must_use]
+    pub const fn pos(&self) -> usize {
+        self.cursor.pos()
+    }
+
+    /// Advances parsing and metric family assembly until a chunk is ready
+    /// ([`DecodeStep::Batch`]), end-of-input is reached ([`DecodeStep::Done`]), or `budget` is
+    /// exhausted at an `Entry` boundary ([`DecodeStep::Pending`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] if `format` is unsupported, the exposition payload fails syntax or
+    /// UTF-8 validation, duplicate or late metadata lines are encountered within a contiguous
+    /// family, duplicate label names appear on a sample, or an OTAP table exceeds its integer ID
+    /// width.
+    pub fn step(&mut self, budget: DecodeBudget) -> Result<DecodeStep, DecodeError> {
+        if self.cursor.done {
+            return Ok(DecodeStep::Done);
+        }
+        if let Some(err) = self.init_err.take() {
+            self.cursor.done = true;
+            return Err(err);
+        }
+        self.decoder
+            .step_decode(&mut self.cursor, self.input, budget)
+    }
+
+    /// Cooperatively pulls the next non-empty [`OtapMetricRecords`] chunk from the stream,
+    /// awaiting `yield_to_runtime()` each time `budget` is exhausted at an `Entry` boundary.
+    pub async fn next_cooperative<Y: Future<Output = ()>>(
+        &mut self,
+        budget: DecodeBudget,
+        mut yield_to_runtime: impl FnMut() -> Y,
+    ) -> Option<Result<OtapMetricRecords, DecodeError>> {
+        loop {
+            match self.step(budget) {
+                Ok(DecodeStep::Pending) => yield_to_runtime().await,
+                Ok(DecodeStep::Batch(batch)) => return Some(Ok(batch)),
+                Ok(DecodeStep::Done) => return None,
+                Err(err) => return Some(Err(err)),
+            }
+        }
+    }
 }
 
 impl Iterator for DecodeStream<'_, '_> {
     type Item = Result<OtapMetricRecords, DecodeError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
+        if self.cursor.done {
             return None;
         }
         if let Some(err) = self.init_err.take() {
-            self.done = true;
+            self.cursor.done = true;
             return Some(Err(err));
         }
-        match self.decoder.ingest_entries::<true>(
-            &mut self.parser,
-            &self.opts,
-            self.default_ts_ns,
-            self.max_data_points,
-            &mut self.pending_series,
-            &mut self.done,
-        ) {
-            Ok(Some(batch)) => Some(Ok(batch)),
-            Ok(None) => None,
-            Err(err) => {
-                self.done = true;
-                self.decoder.reset_scrape();
-                Some(Err(err))
+        match self
+            .decoder
+            .step_cursor::<false>(&mut self.cursor, self.input, None)
+        {
+            Ok(DecodeStep::Batch(batch)) => Some(Ok(batch)),
+            Ok(DecodeStep::Done) => None,
+            Ok(DecodeStep::Pending) => {
+                unreachable!("unbudgeted stream never returns DecodeStep::Pending")
             }
+            Err(err) => Some(Err(err)),
         }
     }
 }
@@ -1246,6 +1707,6 @@ impl FusedIterator for DecodeStream<'_, '_> {}
 
 impl Drop for DecodeStream<'_, '_> {
     fn drop(&mut self) {
-        self.parser.take_scratch_into(self.decoder);
+        self.decoder.finish_decode(&mut self.cursor);
     }
 }

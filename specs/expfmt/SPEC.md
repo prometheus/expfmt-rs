@@ -95,6 +95,9 @@ pub trait Parser<'a> {
     /// `start_timestamp` field.
     fn start_timestamp(&mut self) -> Option<i64>;
 
+    /// Returns the current byte offset of the parser cursor in `input` (`0..=input.len()`).
+    fn pos(&self) -> usize;
+
     /// Populates the caller's reusable label buffer for the current sample.
     fn labels(&self, buf: &mut LabelsBuffer<'a>);
 
@@ -117,7 +120,7 @@ scrape bytes
   -> direct OTAP metric records
 ```
 
-- `ArrowDecoder` appends parsed metrics, attributes, number data points, summary data points, classic and exponential histogram data points, and exemplars directly into Arrow array builders (`arrow-array` and `arrow-schema`), matching the relational `id` and `parent_id` tables in [`rust/otap-dataflow/crates/pdata`](https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/pdata). Callers can either materialize one batch set per scrape with `ArrowDecoder::decode` or pull bounded chunks on demand with `ArrowDecoder::decode_stream` to cap scratch memory and stay within OTAP's `u16` per-batch metric ID limit.
+- `ArrowDecoder` appends parsed metrics, attributes, number data points, summary data points, classic and exponential histogram data points, and exemplars directly into Arrow array builders (`arrow-array` and `arrow-schema`), matching the relational `id` and `parent_id` tables in [`rust/otap-dataflow/crates/pdata`](https://github.com/open-telemetry/otel-arrow/tree/main/rust/otap-dataflow/crates/pdata). Callers can materialize one batch set per scrape with `ArrowDecoder::decode`, pull bounded chunks on demand with `ArrowDecoder::decode_stream` to cap scratch memory and stay within OTAP's `u16` per-batch metric ID limit, or yield cooperatively between bounded steps with `DecodeBudget`, `DecodeStep`, `DecodeStream::step`, `DecodeCursor` (`ArrowDecoder::start_decode` / `start_decode_stream` / `step_decode`), `ArrowDecoder::decode_cooperative`, and `DecodeStream::next_cooperative` so multi-megabyte scrapes do not starve timers or peer tasks on single-threaded `!Send` `LocalSet` runtimes.
 - Metric families in text exposition are decoded as contiguous runs, with `# HELP`, `# TYPE`, and `# UNIT` metadata lines preceding that family's samples. Like OpenMetrics 1.0/2.0 and Prometheus's scrape loop, `ArrowDecoder` tracks only the active family cursor instead of maintaining a whole-scrape hash table to reassemble or reject previously seen names, so a non-contiguous repetition of an earlier metric name starts a fresh untyped run unless preceded by its own metadata.
 - A `LabelFilter` / `Relabeler` hook runs on the borrowed `LabelsBuffer` from Layer 0 so dropped series never allocate in Arrow builders or metric family state.
 - The metric family assembler groups classic histogram `_bucket`, `_sum`, and `_count` lines and summary `quantile`, `_sum`, and `_count` lines (plus OpenMetrics `_created` start timestamps) into complete metric families.

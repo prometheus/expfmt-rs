@@ -20,15 +20,44 @@
 //! ```
 
 use std::fs;
+use std::future::Future;
 use std::hint::black_box;
 use std::path::Path;
+use std::pin::{Pin, pin};
+use std::task::{Context, Poll, Waker};
 
 use benchfmt::{CountingAlloc, Suite};
-use expfmt::arrow::{ArrowDecoder, DecodeOptions};
+use expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep};
 use expfmt::format::Format;
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc::new();
+
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            Poll::Pending
+        }
+    }
+}
+
+#[inline]
+fn poll_cooperative<F: Future>(fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            return out;
+        }
+    }
+}
 
 /// Filters `alltypes.237mfs.prom.txt` down to its 209 counter, gauge, and untyped metric families
 /// until `#8` adds classic histogram and summary assembly.
@@ -78,15 +107,18 @@ fn main() {
     let nometa = fs::read(root.join("alltypes.237mfs.nometa.prom.txt")).unwrap();
     let full = fs::read_to_string(root.join("alltypes.237mfs.prom.txt")).unwrap();
     let typed_simple = filter_counter_gauge_families(&full);
+    let full_bytes = full.as_bytes();
 
     let opts = DecodeOptions::new().with_timestamp_ms(0);
     let stream_256_opts = opts.with_max_data_points_per_batch(256);
+    let budget = DecodeBudget::default();
 
     let mut suite = Suite::from_env("expfmt").with_alloc(&ALLOC);
 
     for (case, payload) in [
         ("alltypes.237mfs.nometa", nometa.as_slice()),
         ("alltypes.209mfs.counter_gauge", typed_simple.as_slice()),
+        ("alltypes.237mfs", full_bytes),
     ] {
         let bytes = payload.len() as u64;
 
@@ -106,6 +138,27 @@ fn main() {
                     black_box(records);
                 }
             })
+            .bench(
+                format!("Decode/case={case}/mode=decode_cooperative"),
+                move |b| {
+                    let mut decoder = ArrowDecoder::new();
+                    black_box(decoder.decode(payload, &Format::TEXT, &opts).unwrap());
+
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        let records = poll_cooperative(decoder.decode_cooperative(
+                            black_box(payload),
+                            &Format::TEXT,
+                            &opts,
+                            budget,
+                            || YieldOnce(false),
+                        ))
+                        .unwrap();
+                        black_box(records);
+                    }
+                },
+            )
             .bench(format!("Decode/case={case}/mode=stream_16k"), move |b| {
                 let mut decoder = ArrowDecoder::new();
                 for chunk in decoder.decode_stream(payload, &Format::TEXT, &opts) {
@@ -135,7 +188,35 @@ fn main() {
                         black_box(chunk.unwrap());
                     }
                 }
-            });
+            })
+            .bench(
+                format!("Decode/case={case}/mode=stream_256_cooperative"),
+                move |b| {
+                    let mut decoder = ArrowDecoder::new();
+                    for chunk in decoder.decode_stream(payload, &Format::TEXT, &stream_256_opts) {
+                        black_box(chunk.unwrap());
+                    }
+
+                    b.set_bytes(bytes);
+                    b.report_allocs();
+                    while b.keep_running() {
+                        let mut stream = decoder.decode_stream(
+                            black_box(payload),
+                            &Format::TEXT,
+                            &stream_256_opts,
+                        );
+                        loop {
+                            match stream.step(budget).unwrap() {
+                                DecodeStep::Pending => {}
+                                DecodeStep::Batch(chunk) => {
+                                    black_box(chunk);
+                                }
+                                DecodeStep::Done => break,
+                            }
+                        }
+                    }
+                },
+            );
     }
 
     suite.run();

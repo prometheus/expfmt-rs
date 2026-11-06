@@ -19,7 +19,7 @@ publish = false
 dhat = "0.3"
 expfmt = { path = "../..", default-features = false, features = ["arrow"] }
 otel-arrow-dfe-pdata = { version = "0.62", features = ["testing"] }
-tokio = { version = "1.48", default-features = false, features = ["macros", "rt"] }
+tokio = { version = "1.48", default-features = false, features = ["macros", "rt", "sync", "time"] }
 
 [lints.rust]
 unsafe_code = "forbid"

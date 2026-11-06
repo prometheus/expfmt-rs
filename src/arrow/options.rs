@@ -11,7 +11,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Configuration policies, [`DecodeOptions`], and [`DecodeError`] for [`super::ArrowDecoder`].
+//! Configuration policies, [`DecodeOptions`], [`DecodeBudget`], and [`DecodeError`] for
+//! [`super::ArrowDecoder`].
+
+use std::time::Duration;
 
 use arrow_schema::ArrowError;
 
@@ -20,6 +23,95 @@ use crate::parse::ParseError;
 /// Default upper bound on data points emitted per [`super::OtapMetricRecords`] chunk in
 /// [`super::ArrowDecoder::decode_stream`].
 pub const DEFAULT_MAX_DATA_POINTS_PER_BATCH: usize = 16_384;
+
+/// Default maximum number of Layer 0 `Entry` items processed per cooperative step
+/// in [`DecodeBudget::default`].
+pub const DEFAULT_DECODE_BUDGET_MAX_ENTRIES: usize = 1_024;
+
+/// Default maximum number of input bytes consumed per cooperative step in
+/// [`DecodeBudget::default`].
+pub const DEFAULT_DECODE_BUDGET_MAX_BYTES: usize = 64 * 1024;
+
+/// Default maximum wall-clock duration per cooperative step in [`DecodeBudget::default`].
+pub const DEFAULT_DECODE_BUDGET_MAX_DURATION: Duration = Duration::from_millis(1);
+
+/// Number of Layer 0 `Entry` items processed between wall-clock `Instant::elapsed` checks in
+/// budgeted decode steps.
+pub const DECODE_BUDGET_DURATION_CHECK_INTERVAL: usize = 16;
+
+/// Cooperative step budget bounding how much entry ingestion work [`super::DecodeStream::step`],
+/// [`super::ArrowDecoder::step_decode`], [`super::ArrowDecoder::decode_cooperative`], and
+/// [`super::DecodeStream::next_cooperative`] perform before yielding back to the caller's event
+/// loop.
+///
+/// Batch construction at a chunk boundary or end-of-input runs synchronously at the end of the
+/// step; use [`super::ArrowDecoder::start_decode_stream`] or
+/// [`super::ArrowDecoder::decode_stream`] to bound per-batch finalization size on large scrapes.
+///
+/// Defaults pair `max_entries = 1_024` (~64–100 KiB for typical Prometheus exposition lines) with
+/// `otel-arrow`'s `max_bytes = 64 KiB` and `max_duration = 1ms` step budgets. Values of `0` for
+/// `max_entries` or `max_bytes` are clamped to `1` during step execution so every step makes
+/// forward progress.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeBudget {
+    /// Maximum number of Layer 0 `Entry` items processed per step.
+    pub max_entries: usize,
+    /// Maximum input bytes consumed per step.
+    pub max_bytes: usize,
+    /// Maximum wall-clock duration per step, checked every
+    /// [`DECODE_BUDGET_DURATION_CHECK_INTERVAL`] entries (or after every entry when set to
+    /// [`Duration::ZERO`]).
+    pub max_duration: Duration,
+}
+
+impl Default for DecodeBudget {
+    fn default() -> Self {
+        Self::default_budget()
+    }
+}
+
+impl DecodeBudget {
+    /// Creates a [`DecodeBudget`] with explicit entry, byte, and duration limits.
+    #[must_use]
+    pub const fn new(max_entries: usize, max_bytes: usize, max_duration: Duration) -> Self {
+        Self {
+            max_entries,
+            max_bytes,
+            max_duration,
+        }
+    }
+
+    /// Creates the default [`DecodeBudget`] (`1_024` entries, `64 KiB`, `1ms`).
+    #[must_use]
+    pub const fn default_budget() -> Self {
+        Self::new(
+            DEFAULT_DECODE_BUDGET_MAX_ENTRIES,
+            DEFAULT_DECODE_BUDGET_MAX_BYTES,
+            DEFAULT_DECODE_BUDGET_MAX_DURATION,
+        )
+    }
+
+    /// Sets the maximum number of Layer 0 entries processed per step.
+    #[must_use]
+    pub const fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries;
+        self
+    }
+
+    /// Sets the maximum number of input bytes consumed per step.
+    #[must_use]
+    pub const fn with_max_bytes(mut self, max_bytes: usize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    /// Sets the maximum wall-clock duration per step.
+    #[must_use]
+    pub const fn with_max_duration(mut self, max_duration: Duration) -> Self {
+        self.max_duration = max_duration;
+        self
+    }
+}
 
 /// Policy controlling how counter `_total` suffixes are emitted on `UnivariateMetrics.name`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -142,6 +234,11 @@ pub enum DecodeError {
     /// The input `Format` is unrecognized or not yet implemented in Layer 1.
     #[error("unsupported exposition format: {0}")]
     UnsupportedFormat(String),
+
+    /// A [`super::DecodeCursor`] from an earlier or different decoder scrape was passed to
+    /// [`super::ArrowDecoder::step_decode`], or the input slice changed between steps.
+    #[error("invalid decode cursor: {0}")]
+    InvalidCursor(&'static str),
 
     /// Unexpected token while lexing or parsing the exposition grammar.
     #[error("{expected} at byte {offset}")]
