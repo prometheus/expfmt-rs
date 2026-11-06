@@ -954,20 +954,57 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
     assert!(matches!(
         job.decoder
             .step_decode(&mut trunc_cursor, &bad_bytes[trunc_pos..], budget),
-        Err(DecodeError::InvalidCursor(_))
+        Err(DecodeError::InvalidCursor(
+            "scrape input buffer length changed across decode steps"
+        ))
     ));
     assert!(trunc_cursor.is_done());
 
+    let mut longer_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut longer_cursor, b"m 1\nn 2\n", budget)
+            .unwrap(),
+        DecodeStep::Pending
+    );
+    assert!(matches!(
+        job.decoder
+            .step_decode(&mut longer_cursor, b"m 1\nn 2\no 3\n", budget),
+        Err(DecodeError::InvalidCursor(
+            "scrape input buffer length changed across decode steps"
+        ))
+    ));
+    assert!(longer_cursor.is_done());
+
     let mut stale_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
-    let _ = job
-        .decoder
-        .decode(b"other 1\n", &Format::TEXT, &opts)
-        .unwrap();
+    let mut stale_finish_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
+    let active_input =
+        b"m{k0=\"0\",k1=\"1\",k2=\"2\",k3=\"3\",k4=\"4\",k5=\"5\",k6=\"6\",k7=\"7\",k8=\"8\",k9=\"9\",k10=\"10\",k11=\"11\",k12=\"12\",k13=\"13\",k14=\"14\",k15=\"15\",k16=\"16\",k17=\"17\"} 1\nm2 2\n";
+    let mut active_cursor = job.decoder.start_decode(&Format::TEXT, &opts).unwrap();
+    assert_eq!(
+        job.decoder
+            .step_decode(&mut active_cursor, active_input, budget)
+            .unwrap(),
+        DecodeStep::Pending
+    );
     assert!(matches!(
         job.decoder.step_decode(&mut stale_cursor, b"m 1\n", budget),
-        Err(DecodeError::InvalidCursor(_))
+        Err(DecodeError::InvalidCursor(
+            "cursor does not belong to current decoder scrape"
+        ))
     ));
     assert!(stale_cursor.is_done());
+    job.decoder.finish_decode(&mut stale_finish_cursor);
+    assert!(stale_finish_cursor.is_done());
+    match job
+        .decoder
+        .step_decode(&mut active_cursor, active_input, DecodeBudget::default())
+        .unwrap()
+    {
+        DecodeStep::Batch(records) => assert_eq!(records.num_data_points(), 2),
+        other => panic!("expected active cursor to finish cleanly, got {other:?}"),
+    }
+    assert!(job.decoder.prom_spans.capacity() >= 18);
 
     let mut dec_a = ArrowDecoder::new();
     let mut dec_b = ArrowDecoder::new();
@@ -975,7 +1012,9 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
     let _ = dec_b.start_decode(&Format::TEXT, &opts).unwrap();
     assert!(matches!(
         dec_b.step_decode(&mut cursor_from_a, b"y 3\n", budget),
-        Err(DecodeError::InvalidCursor(_))
+        Err(DecodeError::InvalidCursor(
+            "cursor does not belong to current decoder scrape"
+        ))
     ));
     assert!(cursor_from_a.is_done());
 }
