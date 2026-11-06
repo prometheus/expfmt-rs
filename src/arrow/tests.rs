@@ -609,12 +609,12 @@ fn interleaved_histogram_lines_and_group_rehashing_assemble_correctly() {
 fn decode_budget_defaults_and_builders() {
     let default_budget = DecodeBudget::default();
     assert_eq!(
-        default_budget.max_entries(),
+        default_budget.max_entries,
         DEFAULT_DECODE_BUDGET_MAX_ENTRIES
     );
-    assert_eq!(default_budget.max_bytes(), DEFAULT_DECODE_BUDGET_MAX_BYTES);
+    assert_eq!(default_budget.max_bytes, DEFAULT_DECODE_BUDGET_MAX_BYTES);
     assert_eq!(
-        default_budget.max_duration(),
+        default_budget.max_duration,
         DEFAULT_DECODE_BUDGET_MAX_DURATION
     );
 
@@ -622,9 +622,9 @@ fn decode_budget_defaults_and_builders() {
         .with_max_entries(16)
         .with_max_bytes(2048)
         .with_max_duration(std::time::Duration::from_millis(2));
-    assert_eq!(custom.max_entries(), 16);
-    assert_eq!(custom.max_bytes(), 2048);
-    assert_eq!(custom.max_duration(), std::time::Duration::from_millis(2));
+    assert_eq!(custom.max_entries, 16);
+    assert_eq!(custom.max_bytes, 2048);
+    assert_eq!(custom.max_duration, std::time::Duration::from_millis(2));
 }
 
 #[test]
@@ -1015,7 +1015,7 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
     //    single poll with zero yields even if `max_entries = 1`.
     let mut fast_yields = 0usize;
     let fast_budget = DecodeBudget::default().with_max_entries(1);
-    assert!(bytes.len() <= fast_budget.max_bytes());
+    assert!(bytes.len() <= fast_budget.max_bytes);
     let (fast_res, fast_polls) =
         drive_future(
             dec.decode_cooperative(bytes, &Format::TEXT, &opts, fast_budget, || {
@@ -1031,7 +1031,7 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
     //    between bounded steps and produces the exact same `OtapMetricRecords`.
     let mut coop_yields = 0usize;
     let coop_budget = DecodeBudget::new(8, 64, std::time::Duration::from_secs(60));
-    assert!(bytes.len() > coop_budget.max_bytes());
+    assert!(bytes.len() > coop_budget.max_bytes);
     let (coop_res, coop_polls) =
         drive_future(
             dec.decode_cooperative(bytes, &Format::TEXT, &opts, coop_budget, || {

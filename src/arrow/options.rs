@@ -103,24 +103,6 @@ impl DecodeBudget {
         self.max_duration = max_duration;
         self
     }
-
-    /// Returns the maximum number of Layer 0 entries processed per step.
-    #[must_use]
-    pub const fn max_entries(&self) -> usize {
-        self.max_entries
-    }
-
-    /// Returns the maximum number of input bytes consumed per step.
-    #[must_use]
-    pub const fn max_bytes(&self) -> usize {
-        self.max_bytes
-    }
-
-    /// Returns the maximum wall-clock duration per step.
-    #[must_use]
-    pub const fn max_duration(&self) -> Duration {
-        self.max_duration
-    }
 }
 
 /// Policy controlling how counter `_total` suffixes are emitted on `UnivariateMetrics.name`.
