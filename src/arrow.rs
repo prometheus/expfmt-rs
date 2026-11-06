@@ -415,7 +415,10 @@ impl ArrowDecoder {
         parser.take_scratch_into(self);
         match res? {
             DecodeStep::Batch(records) => Ok(records),
-            DecodeStep::Pending | DecodeStep::Done => Ok(OtapMetricRecords::default()),
+            DecodeStep::Done => Ok(OtapMetricRecords::default()),
+            DecodeStep::Pending => {
+                unreachable!("unbudgeted decode never returns DecodeStep::Pending")
+            }
         }
     }
 
@@ -1672,7 +1675,10 @@ impl Iterator for DecodeStream<'_, '_> {
             DecodeBudget::default_budget(),
         ) {
             Ok(DecodeStep::Batch(batch)) => Some(Ok(batch)),
-            Ok(DecodeStep::Done | DecodeStep::Pending) => None,
+            Ok(DecodeStep::Done) => None,
+            Ok(DecodeStep::Pending) => {
+                unreachable!("unbudgeted stream never returns DecodeStep::Pending")
+            }
             Err(err) => Some(Err(err)),
         }
     }
