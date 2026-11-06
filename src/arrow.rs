@@ -502,6 +502,10 @@ impl ArrowDecoder {
     /// Advances `cursor` over `input` by at most `budget` entries, bytes, or duration, pausing at
     /// `Entry` boundaries.
     ///
+    /// Callers must pass the exact same `input` byte slice (both contents and length) to every
+    /// `step_decode` call for a given `cursor`, because the cursor and staged parser state store
+    /// byte offsets into `input`.
+    ///
     /// Internal parser scratch buffers are automatically returned to `self` once `cursor` reaches
     /// end-of-input or encounters an error. If `cursor` is abandoned early before completion,
     /// call [`ArrowDecoder::finish_decode`] to reclaim its parser scratch buffers.
