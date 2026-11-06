@@ -20,8 +20,11 @@
 //! ```
 
 use std::fs;
+use std::future::Future;
 use std::hint::black_box;
 use std::path::Path;
+use std::pin::{Pin, pin};
+use std::task::{Context, Poll, Waker};
 
 use benchfmt::{CountingAlloc, Suite};
 use expfmt::arrow::{ArrowDecoder, DecodeBudget, DecodeOptions, DecodeStep};
@@ -29,6 +32,32 @@ use expfmt::format::Format;
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc::new();
+
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            Poll::Pending
+        }
+    }
+}
+
+#[inline]
+fn poll_cooperative<F: Future>(fut: F) -> F::Output {
+    let mut fut = pin!(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            return out;
+        }
+    }
+}
 
 /// Filters `alltypes.237mfs.prom.txt` down to its 209 counter, gauge, and untyped metric families
 /// until `#8` adds classic histogram and summary assembly.
@@ -118,20 +147,15 @@ fn main() {
                     b.set_bytes(bytes);
                     b.report_allocs();
                     while b.keep_running() {
-                        let mut cursor = decoder.start_decode(&Format::TEXT, &opts).unwrap();
-                        loop {
-                            match decoder
-                                .step_decode(&mut cursor, black_box(payload), budget)
-                                .unwrap()
-                            {
-                                DecodeStep::Pending => {}
-                                DecodeStep::Batch(records) => {
-                                    black_box(records);
-                                    break;
-                                }
-                                DecodeStep::Done => break,
-                            }
-                        }
+                        let records = poll_cooperative(decoder.decode_cooperative(
+                            black_box(payload),
+                            &Format::TEXT,
+                            &opts,
+                            budget,
+                            || YieldOnce(false),
+                        ))
+                        .unwrap();
+                        black_box(records);
                     }
                 },
             )
