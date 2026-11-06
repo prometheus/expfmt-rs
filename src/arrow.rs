@@ -532,7 +532,7 @@ impl ArrowDecoder {
             });
         }
         let expected_len = *cursor.input_len.get_or_insert(input.len());
-        if input.len() != expected_len || cursor.pos > input.len() {
+        if input.len() != expected_len {
             self.finish_decode(cursor);
             return Err(DecodeError::Syntax {
                 expected: "unchanged scrape input buffer across decode steps",
