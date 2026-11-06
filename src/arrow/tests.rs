@@ -1152,4 +1152,21 @@ fn cooperative_async_helpers_respect_fast_path_and_yield_budgets() {
     ));
     assert!(empty_coop.unwrap().is_empty());
     assert_eq!(empty_polls, 1);
+
+    let (stream_err_res, stream_err_polls) = drive_future(async {
+        let mut stream = dec.decode_stream(bad_coop, &Format::TEXT, &stream_opts);
+        let first = stream
+            .next_cooperative(err_budget, || YieldOnce(false))
+            .await;
+        let second = stream
+            .next_cooperative(err_budget, || YieldOnce(false))
+            .await;
+        (first, second)
+    });
+    assert!(matches!(
+        stream_err_res.0,
+        Some(Err(DecodeError::Syntax { .. }))
+    ));
+    assert!(stream_err_res.1.is_none());
+    assert_eq!(stream_err_polls, 1);
 }
