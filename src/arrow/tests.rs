@@ -729,7 +729,16 @@ fn decode_stream_step_respects_entry_byte_and_duration_budgets() {
         &DecodeOptions::new().with_max_data_points_per_batch(64),
     );
     assert_eq!(dur_stream.step(dur_budget).unwrap(), DecodeStep::Pending);
-    assert!(dur_stream.pos() > 0 && dur_stream.pos() < heavy_lines.len());
+    let consumed_lines = heavy_lines.as_bytes()[..dur_stream.pos()]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count();
+    assert_eq!(consumed_lines, DECODE_BUDGET_DURATION_CHECK_INTERVAL);
+    match dur_stream.step(dur_budget).unwrap() {
+        DecodeStep::Batch(batch) => assert_eq!(batch.num_data_points(), 20),
+        other => panic!("expected DecodeStep::Batch, got {other:?}"),
+    }
+    assert_eq!(dur_stream.step(dur_budget).unwrap(), DecodeStep::Done);
 }
 
 #[test]
