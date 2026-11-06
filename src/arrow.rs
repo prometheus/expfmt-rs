@@ -30,6 +30,7 @@ mod tests;
 
 use std::future::Future;
 use std::iter::FusedIterator;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use crate::format::{Format, FormatType};
@@ -55,6 +56,15 @@ pub use self::schema::PROMETHEUS_TYPE_METADATA_KEY;
 
 /// Maximum distinct `UnivariateMetrics` rows representable in a single OTAP batch (`u16` IDs).
 const MAX_METRICS_PER_BATCH: usize = (u16::MAX as usize) + 1;
+
+/// Process-wide counter assigning each decoder scrape a unique ID so a [`DecodeCursor`] from one
+/// [`ArrowDecoder`] cannot pass the active-scrape check on another [`ArrowDecoder`].
+static NEXT_SCRAPE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[inline]
+fn next_scrape_id() -> u64 {
+    NEXT_SCRAPE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 type SpanAndTraceId = (Option<[u8; 8]>, Option<[u8; 16]>);
 
@@ -680,7 +690,7 @@ impl ArrowDecoder {
     }
 
     fn reset_scrape(&mut self) {
-        self.scrape_id = self.scrape_id.wrapping_add(1);
+        self.scrape_id = next_scrape_id();
         self.current_family.clear();
         self.assembly.clear();
         self.reset_batch();

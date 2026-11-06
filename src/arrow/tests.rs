@@ -959,6 +959,16 @@ fn lifetime_free_decode_cursor_supports_owned_job_across_steps() {
         Err(DecodeError::Syntax { .. })
     ));
     assert!(stale_cursor.is_done());
+
+    let mut dec_a = ArrowDecoder::new();
+    let mut dec_b = ArrowDecoder::new();
+    let mut cursor_from_a = dec_a.start_decode(&Format::TEXT, &opts).unwrap();
+    let _ = dec_b.start_decode(&Format::TEXT, &opts).unwrap();
+    assert!(matches!(
+        dec_b.step_decode(&mut cursor_from_a, b"y 3\n", budget),
+        Err(DecodeError::Syntax { .. })
+    ));
+    assert!(cursor_from_a.is_done());
 }
 
 #[test]
