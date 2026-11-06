@@ -26,7 +26,7 @@ pub const DEFAULT_MAX_DATA_POINTS_PER_BATCH: usize = 16_384;
 
 /// Default maximum number of Layer 0 `Entry` items processed per cooperative step
 /// in [`DecodeBudget::default`].
-pub const DEFAULT_DECODE_BUDGET_MAX_ENTRIES: usize = 128;
+pub const DEFAULT_DECODE_BUDGET_MAX_ENTRIES: usize = 1_024;
 
 /// Default maximum number of input bytes consumed per cooperative step in
 /// [`DecodeBudget::default`].
@@ -48,9 +48,10 @@ pub const DECODE_BUDGET_DURATION_CHECK_INTERVAL: usize = 16;
 /// step; use [`super::ArrowDecoder::start_decode_stream`] or
 /// [`super::ArrowDecoder::decode_stream`] to bound per-batch finalization size on large scrapes.
 ///
-/// Defaults match `otel-arrow`'s `DecodeBudget::default()` (`max_entries = 128`,
-/// `max_bytes = 64 KiB`, `max_duration = 1ms`). Values of `0` for `max_entries` or `max_bytes`
-/// are clamped to `1` during step execution so every step makes forward progress.
+/// Defaults pair `max_entries = 1_024` (~64–100 KiB for typical Prometheus exposition lines) with
+/// `otel-arrow`'s `max_bytes = 64 KiB` and `max_duration = 1ms` step budgets. Values of `0` for
+/// `max_entries` or `max_bytes` are clamped to `1` during step execution so every step makes
+/// forward progress.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodeBudget {
     /// Maximum number of Layer 0 `Entry` items processed per step.
@@ -80,7 +81,7 @@ impl DecodeBudget {
         }
     }
 
-    /// Creates the default [`DecodeBudget`] (`128` entries, `64 KiB`, `1ms`).
+    /// Creates the default [`DecodeBudget`] (`1_024` entries, `64 KiB`, `1ms`).
     #[must_use]
     pub const fn default_budget() -> Self {
         Self::new(
